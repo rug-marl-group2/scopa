@@ -9,7 +9,6 @@ from gymnasium import spaces
 import numpy as np
 import random
 import itertools
-from tlogger import TLogger
 
 NUM_ITERS = 100  # Number of iterations before truncation
 PRINT_DEBUG = False
@@ -29,13 +28,10 @@ class Card:
         elif rank_raster == 8:
             rank_raster = "Jack"
 
-        if self.suit == "bello":
-            return f"{self.rank} {self.suit}"
-        else:
-            return f"{self.rank} di {self.suit}"
+        return f"{rank_raster} of {self.suit}"
 
 class Deck:
-    suits = ['picche', 'bello', 'fiori', 'cuori']
+    suits = ['spades', 'diamonds', 'clubs', 'hearts']
     ranks = list(range(1, 11))  # Ranks from 1 to 7, plus 8, 9, and 10 for face cards.
 
     def __init__(self):
@@ -43,6 +39,7 @@ class Deck:
         self.shuffle()
 
     def shuffle(self, seed = 42):
+        # Let's watch out the seed cause we might want non-deterministic shuffling
         random.seed(seed)
         random.shuffle(self.cards)
 
@@ -140,20 +137,20 @@ class ScopaGame:
             team2_points += 1
 
         # Most Coins ("ori")
-        team1_coins = [card for card in team1_captures if card.suit == 'bello']
-        team2_coins = [card for card in team2_captures if card.suit == 'bello']
+        team1_coins = [card for card in team1_captures if card.suit == 'diamonds']
+        team2_coins = [card for card in team2_captures if card.suit == 'diamonds']
         if len(team1_coins) > len(team2_coins):
             team1_points += 1
         elif len(team2_coins) > len(team1_coins):
             team2_points += 1
 
-        # Sette Bello (Seven of Coins)
+        # Sette diamonds (Seven of Coins)
         for card in team1_captures:
-            if card.rank == 7 and card.suit == 'bello':
+            if card.rank == 7 and card.suit == 'diamonds':
                 team1_points += 1
                 break
         for card in team2_captures:
-            if card.rank == 7 and card.suit == 'bello':
+            if card.rank == 7 and card.suit == 'diamonds':
                 team2_points += 1
                 break
 
@@ -249,37 +246,37 @@ class MaScopaEnv(AECEnv):
 
         for card in player.hand:
             index = (card.rank - 1) + {
-                'cuori': 0,
-                'picche': 10,
-                'fiori': 20,
-                'bello': 30
+                'hearts': 0,
+                'spades': 10,
+                'clubs': 20,
+                'diamonds': 30
             }[card.suit]
             state[0][index] = 1
 
         for card in self.game.table:
             index = (card.rank - 1) + {
-                'cuori': 0,
-                'picche': 10,
-                'fiori': 20,
-                'bello': 30
+                'hearts': 0,
+                'spades': 10,
+                'clubs': 20,
+                'diamonds': 30
             }[card.suit]
             state[1][index] = 1
 
         for card in player.captures:
             index = (card.rank - 1) + {
-                'cuori': 0,
-                'picche': 10,
-                'fiori': 20,
-                'bello': 30
+                'hearts': 0,
+                'spades': 10,
+                'clubs': 20,
+                'diamonds': 30
             }[card.suit]
             state[2][index] = 1
         
         for card in friend.captures:
             index = (card.rank - 1) + {
-                'cuori': 0,
-                'picche': 10,
-                'fiori': 20,
-                'bello': 30
+                'hearts': 0,
+                'spades': 10,
+                'clubs': 20,
+                'diamonds': 30
             }[card.suit]
             state[2][index] = 1
 
@@ -290,10 +287,10 @@ class MaScopaEnv(AECEnv):
         for i, enemy in enumerate(others):
             for card in enemy.history:
                 index = (card.rank - 1) + {
-                    'cuori': 0,
-                    'picche': 10,
-                    'fiori': 20,
-                    'bello': 30
+                    'hearts': 0,
+                    'spades': 10,
+                    'clubs': 20,
+                    'diamonds': 30
                 }[card.suit]
                 state[3 + i][index] = 1
 
@@ -328,10 +325,10 @@ class MaScopaEnv(AECEnv):
             action_mask = np.zeros(40, dtype=int)
             for card in self.game.players[self.agent_name_mapping[self.agent_selection]].hand:
                 index = (card.rank - 1) + {
-                    'cuori': 0,
-                    'picche': 10,
-                    'fiori': 20,
-                    'bello': 30
+                    'hearts': 0,
+                    'spades': 10,
+                    'clubs': 20,
+                    'diamonds': 30
                 }[card.suit]
                 action_mask[index] = 1
             
@@ -341,10 +338,10 @@ class MaScopaEnv(AECEnv):
             for t, player in enumerate(self.game.players):
                 for card in player.hand:
                     index = (t * 40) + (card.rank - 1) + {
-                        'cuori': 0,
-                        'picche': 10,
-                        'fiori': 20,
-                        'bello': 30
+                        'hearts': 0,
+                        'spades': 10,
+                        'clubs': 20,
+                        'diamonds': 30
                     }[card.suit]
                     action_mask[index] = 1
         else:
@@ -354,10 +351,10 @@ class MaScopaEnv(AECEnv):
 
             for card in player.hand:
                 index = (card.rank - 1) + {
-                    'cuori': 0,
-                    'picche': 10,
-                    'fiori': 20,
-                    'bello': 30
+                    'hearts': 0,
+                    'spades': 10,
+                    'clubs': 20,
+                    'diamonds': 30
                 }[card.suit]
                 action_mask[index] = 1
 
@@ -382,10 +379,10 @@ class MaScopaEnv(AECEnv):
 
         for c in player.hand:
             ind = (c.rank - 1) + {
-                'cuori': 0,
-                'picche': 10,
-                'fiori': 20,
-                'bello': 30
+                'hearts': 0,
+                'spades': 10,
+                'clubs': 20,
+                'diamonds': 30
             }[c.suit]
 
             if ind == action:

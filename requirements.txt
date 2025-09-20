@@ -2,3 +2,4 @@ pettingzoo
 gymnasium
 numpy
 tlogger
+ipython
