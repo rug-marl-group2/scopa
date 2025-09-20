@@ -1,4 +1,6 @@
 '''
+This is a PettingZoo environment for the Italian card game Scopa d'Assi, designed for 4 players in teams of 2.
+
 Quick execution:
 ipython test.py
 '''
@@ -14,11 +16,19 @@ NUM_ITERS = 100  # Number of iterations before truncation
 PRINT_DEBUG = False
 
 class Card:
+    """
+    A class representing a single playing card.
+    
+    :param rank: The rank of the card (1-10, where 8=Jack, 9=Queen, 10=King).
+    :param suit: The suit of the card ('spades', 'diamonds', 'clubs', 'hearts').
+    """
     def __init__(self, rank: int, suit: str):
         self.rank = rank
         self.suit = suit
 
     def __str__(self):
+        """ Returns a string representation of the card."""
+        
         rank_raster = self.rank
 
         if rank_raster == 10:
@@ -27,10 +37,16 @@ class Card:
             rank_raster = "Queen"
         elif rank_raster == 8:
             rank_raster = "Jack"
+        elif rank_raster == 1:
+            rank_raster = "Ace"
 
         return f"{rank_raster} of {self.suit}"
 
 class Deck:
+    """
+    A class representing a standard deck of 40 playing cards used in Scopa.
+
+    """
     suits = ['spades', 'diamonds', 'clubs', 'hearts']
     ranks = list(range(1, 11))  # Ranks from 1 to 7, plus 8, 9, and 10 for face cards.
 
@@ -39,7 +55,7 @@ class Deck:
         self.shuffle()
 
     def shuffle(self, seed = 42):
-        # Let's watch out the seed cause we might want non-deterministic shuffling
+        # (!) Let's watch out the seed cause we might want non-deterministic shuffling
         random.seed(seed)
         random.shuffle(self.cards)
 
@@ -47,6 +63,12 @@ class Deck:
         return [self.cards.pop() for _ in range(num_cards)]
 
 class Player:
+    """
+    A class representing a player in Scopa.
+
+    :param side: The team side of the player (1 or 2).
+    :param name: The name of the player.
+    """
     def __init__(self, side: int, name: str):
         self.side = side
         self.name = name
@@ -56,7 +78,6 @@ class Player:
         self.scopas = 0
 
     def reset(self):
-        
         self.hand = []
         self.captures = []
         self.history = []
@@ -69,6 +90,9 @@ class Player:
 
     def play_card(self, card_index):
         return self.hand.pop(card_index)
+
+## added comments till here ..
+
 
 class ScopaGame:
     def __init__(self, logger):
