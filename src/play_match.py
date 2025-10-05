@@ -1,3 +1,28 @@
+"""
+Loads a saved CFR checkpoint and plays Scopa matches either in self-play
+(all seats use the loaded policy) or against random opponents (seats 1 & 3).
+
+Accepted checkpoints:
+    • Average-policy checkpoints saved as 'avg' or extracted from full trainer state.
+      (This script uses CFRTrainer.load_avg_policy under the hood.)
+
+Main features:
+    • Self-play or policy-vs-random modes
+    • Repeatable runs via --seed
+    • Optional verbose, step-by-step, human-readable play-by-play
+    • Lightweight logger + timestamped run dir for logs
+
+
+Usage examples:
+    # Self-play a single verbose match
+    ipython play_match.py -- \
+        --checkpoint runs/scopa_cfr/2025-10-05-12-00-00/policy_avg.pkl \
+        --mode selfplay \
+        --games 1 \
+"""
+
+
+
 import argparse
 import time
 import random

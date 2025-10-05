@@ -3,3 +3,5 @@ gymnasium
 numpy
 tlogger
 ipython
+tensorboardX
+tqdm
