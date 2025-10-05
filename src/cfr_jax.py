@@ -182,10 +182,18 @@ def regret_matching(regrets: np.ndarray, legal_mask: np.ndarray) -> np.ndarray:
 
 
 class CFRTrainer:
-    def __init__(self, seed: int = 42, tlogger: Optional[object] = None, branch_topk: Optional[int] = None):
+    def __init__(self, seed: int = 42, tlogger: Optional[object] = None, branch_topk: Optional[int] = None,
+                 max_infosets: Optional[int] = None, obs_key_mode: str = "full", dtype: np.dtype = np.float16):
         self.rng = Generator(PCG64(seed))
         self.tlogger = tlogger
         self.branch_topk = branch_topk  # limit branching at traverser nodes for speed
+
+        # Memory controls
+        self.max_infosets = int(max_infosets) if (max_infosets is not None and max_infosets > 0) else None
+        self._last_seen: Dict[Tuple[int, bytes], int] = {}
+        self._clock: int = 0
+        self.obs_key_mode = str(obs_key_mode)
+        self.dtype = np.dtype(dtype)
 
         # infoset -> arrays of size 40 (global card index space)
         self.cum_regret: Dict[Tuple[int, bytes], np.ndarray] = {}
@@ -193,9 +201,14 @@ class CFRTrainer:
 
     def _get_strategy(self, infoset_key, legal_mask: np.ndarray) -> np.ndarray:
         if infoset_key not in self.cum_regret:
-            self.cum_regret[infoset_key] = np.zeros((NUM_CARDS,), dtype=np.float32)
-            self.cum_strategy[infoset_key] = np.zeros((NUM_CARDS,), dtype=np.float32)
-        return regret_matching(self.cum_regret[infoset_key], legal_mask.astype(np.float32))
+            self.cum_regret[infoset_key] = np.zeros((NUM_CARDS,), dtype=self.dtype)
+            self.cum_strategy[infoset_key] = np.zeros((NUM_CARDS,), dtype=self.dtype)
+            self._touch_key(infoset_key)
+            self._evict_if_needed(avoid_key=infoset_key)
+        else:
+            self._touch_key(infoset_key)
+        # Use float32 math for stability
+        return regret_matching(np.asarray(self.cum_regret[infoset_key], dtype=np.float32), legal_mask.astype(np.float32))
 
     def _safe_sample(self, p_arr: np.ndarray, legal_mask: np.ndarray, rng: Optional[Generator] = None) -> int:
         """Sample an action robustly over the legal set.
@@ -232,14 +245,45 @@ class CFRTrainer:
 
     def _obs_key(self, obs: np.ndarray) -> bytes:
         # Compact, deterministic key for an observation (16-byte BLAKE2b digest)
-        # Using view(np.uint8) avoids an extra copy versus tobytes() in many cases
-        return hashlib.blake2b(obs.view(np.uint8), digest_size=16).digest()
+        # Optionally coarsen the key to reduce unique infosets and memory.
+        mode = self.obs_key_mode
+        if mode == "hand_table":
+            obs_slice = obs[:2]
+        elif mode == "compact":
+            obs_slice = obs[:3]
+        else:
+            obs_slice = obs
+        view = np.ascontiguousarray(obs_slice).view(np.uint8)
+        return hashlib.blake2b(view, digest_size=16).digest()
 
     def _infoset(self, st: NState, seat: int) -> Tuple[Tuple[int, bytes], np.ndarray]:
         obs = np_build_obs(st, seat)
         key = (seat, self._obs_key(obs))
         legal = (obs[0] > 0).astype(np.int32)
         return key, legal
+
+    def _touch_key(self, key: Tuple[int, bytes]) -> None:
+        self._clock += 1
+        self._last_seen[key] = self._clock
+
+    def _evict_if_needed(self, avoid_key: Optional[Tuple[int, bytes]] = None) -> None:
+        if self.max_infosets is None:
+            return
+        while len(self.cum_regret) > self.max_infosets:
+            # Evict least recently touched key (simple LRU)
+            to_evict = None
+            min_seen = None
+            for k, seen in self._last_seen.items():
+                if avoid_key is not None and k == avoid_key:
+                    continue
+                if min_seen is None or seen < min_seen:
+                    min_seen = seen
+                    to_evict = k
+            if to_evict is None:
+                break
+            self.cum_regret.pop(to_evict, None)
+            self.cum_strategy.pop(to_evict, None)
+            self._last_seen.pop(to_evict, None)
 
     def _mccfr(self, st: NState, target_seat: int) -> float:
         if np_is_terminal(st):
@@ -279,8 +323,8 @@ class CFRTrainer:
             regrets = np.zeros(NUM_CARDS, dtype=np.float32)
             # Only actions we evaluated contribute; others stay at 0 for this visit
             regrets[branch_actions] = action_values[branch_actions] - util
-            self.cum_regret[infoset_key] += regrets
-            self.cum_strategy[infoset_key] += sigma
+            self.cum_regret[infoset_key] += regrets.astype(self.dtype)
+            self.cum_strategy[infoset_key] += sigma.astype(self.dtype)
             return util
         else:
             # External sampling for others
@@ -298,7 +342,11 @@ class CFRTrainer:
 
             st_next, _ = np_step(st_next, a)
             # Track average strategy
-            self.cum_strategy[infoset_key] = self.cum_strategy.get(infoset_key, np.zeros((NUM_CARDS,), dtype=np.float32)) + sigma
+            if infoset_key not in self.cum_strategy:
+                self.cum_strategy[infoset_key] = np.zeros((NUM_CARDS,), dtype=self.dtype)
+                self._touch_key(infoset_key)
+                self._evict_if_needed(avoid_key=infoset_key)
+            self.cum_strategy[infoset_key] += sigma.astype(self.dtype)
             return self._mccfr(st_next, target_seat)
 
     def _metrics_snapshot(self) -> Dict[str, float]:
@@ -425,11 +473,18 @@ class CFRTrainer:
         if mode == "random":
             return int(rng.choice(legal_actions)) if legal_actions.size > 0 else 0
 
-        if mode == "avg" and policy_map is not None:
+        if mode == "avg":
             key = (seat, self._obs_key(obs))
-            if key in policy_map:
+            if policy_map is not None and key in policy_map:
                 probs = policy_map[key]
                 return self._safe_sample(probs, legal, rng)
+            strat_sum = self.cum_strategy.get(key)
+            if strat_sum is not None:
+                strat = np.asarray(strat_sum, dtype=np.float32)
+                total = float(strat.sum())
+                if total > 0.0 and np.isfinite(total):
+                    probs = strat / total
+                    return self._safe_sample(probs, legal, rng)
             # Fallback to current if unseen
 
         # Current regret-matching policy
@@ -444,8 +499,8 @@ class CFRTrainer:
         If selfplay=True, all seats use the same policy. Otherwise, seats 0/2 use policy and 1/3 use random.
         """
         rng = Generator(PCG64(seed))
-        # Prepare average policy map once if requested
-        policy_map = self.get_average_policy() if use_avg_policy else None
+        # Compute average policy on-demand during evaluation to avoid duplicating memory
+        policy_map = None
 
         wins0 = 0
         wins1 = 0
@@ -546,7 +601,7 @@ class CFRTrainer:
         infoset_key = (seat, self._obs_key(obs))
         legal = (obs[0] > 0).astype(np.int32)
         if infoset_key not in self.cum_regret:
-            self.cum_regret[infoset_key] = np.zeros((NUM_CARDS,), dtype=np.float32)
+            self.cum_regret[infoset_key] = np.zeros((NUM_CARDS,), dtype=self.dtype)
         probs = regret_matching(self.cum_regret[infoset_key], legal.astype(np.float32))
         return self._safe_sample(probs, legal, self.rng)
 
@@ -570,6 +625,9 @@ class CFRTrainer:
                 "cum_regret": self.cum_regret,
                 "cum_strategy": self.cum_strategy,
                 "branch_topk": self.branch_topk,
+                "max_infosets": self.max_infosets,
+                "obs_key_mode": self.obs_key_mode,
+                "dtype": str(self.dtype.name),
             }
         else:
             raise ValueError(f"Unknown save kind: {kind}")
@@ -596,7 +654,11 @@ class CFRTrainer:
             payload = pickle.load(f)
         if payload.get("type") != "full":
             raise ValueError("Not a full trainer checkpoint")
-        tr = CFRTrainer(seed=seed, tlogger=tlogger, branch_topk=payload.get("branch_topk"))
+        tr = CFRTrainer(seed=seed, tlogger=tlogger,
+                        branch_topk=payload.get("branch_topk"),
+                        max_infosets=payload.get("max_infosets"),
+                        obs_key_mode=payload.get("obs_key_mode", "full"),
+                        dtype=np.dtype(payload.get("dtype", "float16")))
         tr.cum_regret = payload["cum_regret"]
         tr.cum_strategy = payload["cum_strategy"]
         return tr

@@ -79,7 +79,7 @@ def preview_game(env, policy: str, trainer: Optional[CFRTrainer]):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--iters", type=int, default=1000)
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--seed", type=int, default=time.time_ns())
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--log_every", type=int, default=100)
     parser.add_argument("--branch_topk", type=int, default=3, help="Limit traverser branching to top-K actions by current policy (speed boost)")
@@ -88,13 +88,23 @@ def main():
     parser.add_argument("--eval_every", type=int, default=100, help="Evaluate and log game metrics every N iters (0 to disable)")
     parser.add_argument("--eval_eps", type=int, default=64, help="Episodes per evaluation mode")
     parser.add_argument("--eval_policy", type=str, default="avg", choices=["avg", "current"], help="Which policy to use for evaluation")
+    parser.add_argument("--max_infosets", type=int, default=0, help="Cap the number of stored infosets (0 = unlimited)")
+    parser.add_argument("--obs_key_mode", type=str, default="full", choices=["full", "compact", "hand_table"], help="How much of the observation to hash for infoset keys")
+    parser.add_argument("--table_dtype", type=str, default="float16", choices=["float16", "float32"], help="Data type for regret/strategy tables to reduce memory")
     parser.add_argument("--save_path", type=str, default="", help="Path to save trained model/policy (.pkl)")
     parser.add_argument("--save_kind", type=str, default="avg", choices=["avg", "full"], help="Save average policy or full trainer state")
     args = parser.parse_args()
 
     # Create logger first so CFR can log metrics
     tlog = TLogger(log_dir="scopa/runs/scopa_cfr/"+time.strftime("%Y-%m-%d-%H-%M-%S"))
-    trainer = CFRTrainer(seed=args.seed, tlogger=tlog, branch_topk=args.branch_topk)
+    import numpy as np  # local import to keep file lean
+    dtype_map = {"float16": np.float16, "float32": np.float32}
+    trainer = CFRTrainer(seed=args.seed,
+                         tlogger=tlog,
+                         branch_topk=args.branch_topk,
+                         max_infosets=(args.max_infosets if args.max_infosets and args.max_infosets > 0 else None),
+                         obs_key_mode=args.obs_key_mode,
+                         dtype=dtype_map.get(args.table_dtype, np.float16))
     trainer.train(
         iterations=args.iters,
         seed=args.seed,

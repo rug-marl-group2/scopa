@@ -11,4 +11,4 @@ module --force purge
 module load CUDA/12.4.0
 source /home1/s6133800/miniconda3/etc/profile.d/conda.sh
 conda activate scopa_jax
-srun python scopa/src/train_cfr.py --iters 1000 --log_every 10 --eval_every 100 --eval_eps 32 --eval_policy avg --save_kind avg
+srun python scopa/src/train_cfr.py --iters 1000 --log_every 10 --eval_every 100 --eval_eps 32 --eval_policy avg --save_kind avg --branch_topk 3 --max_infosets 300000 --obs_key_mode compact
