@@ -4,21 +4,13 @@ using a JAX-based implementation. It logs training metrics, optionally evaluates
 the resulting policy, and previews gameplay using both random and learned strategies.        
 
 Example Usage:
-    ipython src/train_cfr.py -- \
-        --iters 2000 \
-        --eval_every 200 \
-        --eval_policy avg \
-        --branch_topk 3 \
-        --table_dtype float16 \
-        --preview_random 1 \
-        --preview_policy 1
+    python scopa/src/train_cfr.py --iters 5000 --log_every 10 --eval_every 100 --eval_eps 64 --eval_policy avg --save_kind avg --branch_topk 1 --max_infosets 300000 --obs_key_mode compact
 """
 
 
-XLA_PYTHON_CLIENT_PREALLOCATE=False # Prevents JAX/XLA from preallocating all GPU memory.
-
 import argparse
 import os
+os.environ['XLA_PYTHON_CLIENT_PREALLOCATE']='false'
 import sys
 import random
 import time

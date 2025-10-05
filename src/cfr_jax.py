@@ -22,6 +22,7 @@ CARD_SUITS = np.concatenate([np.full((NUM_RANKS,), si, dtype=np.int32) for si in
 
 
 class NState:
+    """Lightweight NumPy state for CFR traversals."""
     def __init__(self):
         self.hands = np.zeros((4, NUM_CARDS), dtype=np.int8)
         self.table = np.zeros((NUM_CARDS,), dtype=np.int8)
@@ -172,6 +173,7 @@ def np_evaluate_round(st: NState) -> tuple[int, int]:
 # --------------------------
 
 def regret_matching(regrets: np.ndarray, legal_mask: np.ndarray) -> np.ndarray:
+    """Convert cumulative regrets to a stochastic policy over legal actions."""
     pos = np.maximum(regrets, 0.0) * legal_mask
     s = pos.sum()
     if s > 0:
@@ -182,6 +184,7 @@ def regret_matching(regrets: np.ndarray, legal_mask: np.ndarray) -> np.ndarray:
 
 
 class CFRTrainer:
+    """NumPy CFR trainer with hashed infosets and memory guards."""
     def __init__(self, seed: int = 42, tlogger: Optional[object] = None, branch_topk: Optional[int] = None,
                  max_infosets: Optional[int] = None, obs_key_mode: str = "full", dtype: np.dtype = np.float16):
         self.rng = Generator(PCG64(seed))
@@ -200,6 +203,7 @@ class CFRTrainer:
         self.cum_strategy: Dict[Tuple[int, bytes], np.ndarray] = {}
 
     def _get_strategy(self, infoset_key, legal_mask: np.ndarray) -> np.ndarray:
+        """Fetch/init tables for the given infoset and compute policy."""
         if infoset_key not in self.cum_regret:
             self.cum_regret[infoset_key] = np.zeros((NUM_CARDS,), dtype=self.dtype)
             self.cum_strategy[infoset_key] = np.zeros((NUM_CARDS,), dtype=self.dtype)
@@ -244,8 +248,7 @@ class CFRTrainer:
         return float(t0 if (seat % 2 == 0) else t1)
 
     def _obs_key(self, obs: np.ndarray) -> bytes:
-        # Compact, deterministic key for an observation (16-byte BLAKE2b digest)
-        # Optionally coarsen the key to reduce unique infosets and memory.
+        """Compact hash (16-byte BLAKE2b) for observation; may use a slice."""
         mode = self.obs_key_mode
         if mode == "hand_table":
             obs_slice = obs[:2]
@@ -257,6 +260,7 @@ class CFRTrainer:
         return hashlib.blake2b(view, digest_size=16).digest()
 
     def _infoset(self, st: NState, seat: int) -> Tuple[Tuple[int, bytes], np.ndarray]:
+        """Return (infoset_key, legal_mask) for seat in state."""
         obs = np_build_obs(st, seat)
         key = (seat, self._obs_key(obs))
         legal = (obs[0] > 0).astype(np.int32)
@@ -286,6 +290,7 @@ class CFRTrainer:
             self._last_seen.pop(to_evict, None)
 
     def _mccfr(self, st: NState, target_seat: int) -> float:
+        """Recursive MCCFR traversal optimizing `target_seat`."""
         if np_is_terminal(st):
             return self._evaluate_utility(st, target_seat)
 
@@ -295,7 +300,7 @@ class CFRTrainer:
 
         legal_actions = np.nonzero(legal_mask)[0]
         if cur_seat == target_seat:
-            # Deterministic branching over legal actions for traverser
+            # Traverser: deterministically branch over legal actions
             action_values = np.zeros(NUM_CARDS, dtype=np.float32)
             util = 0.0
             # Optionally limit branching to top-K by current policy
@@ -327,8 +332,7 @@ class CFRTrainer:
             self.cum_strategy[infoset_key] += sigma.astype(self.dtype)
             return util
         else:
-            # External sampling for others
-            # Robust sampling over legal actions using current policy
+            # Others: external sampling from current policy
             a = self._safe_sample(sigma, legal_mask, self.rng)
 
             st_next = NState()
@@ -598,6 +602,7 @@ class CFRTrainer:
         return policy
 
     def act_from_obs(self, seat: int, obs: np.ndarray) -> int:
+        """Select an action via regret-matching at the given observation."""
         infoset_key = (seat, self._obs_key(obs))
         legal = (obs[0] > 0).astype(np.int32)
         if infoset_key not in self.cum_regret:
@@ -671,6 +676,7 @@ class SavedPolicy:
         self.rng = Generator(PCG64(seed))
 
     def act(self, seat: int, obs: np.ndarray) -> int:
+        """Sample an action from the saved average policy, restricted to legal."""
         legal = (obs[0] > 0).astype(np.int32)
         legal_idx = np.nonzero(legal)[0]
         if legal_idx.size == 0:
