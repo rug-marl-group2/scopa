@@ -6,6 +6,7 @@ import numpy as np
 from numpy.random import Generator, PCG64
 from tqdm import trange
 import hashlib
+import jax
 
 
 # --------------------------
@@ -186,10 +187,14 @@ def regret_matching(regrets: np.ndarray, legal_mask: np.ndarray) -> np.ndarray:
 class CFRTrainer:
     """NumPy CFR trainer with hashed infosets and memory guards."""
     def __init__(self, seed: int = 42, tlogger: Optional[object] = None, branch_topk: Optional[int] = None,
-                 max_infosets: Optional[int] = None, obs_key_mode: str = "full", dtype: np.dtype = np.float16):
-        self.rng = Generator(PCG64(seed))
+                 max_infosets: Optional[int] = None, obs_key_mode: str = "full",
+                 dtype: np.dtype = np.float16, rm_plus: bool = True, rng: Optional[Generator] = None):
         self.tlogger = tlogger
-        self.branch_topk = branch_topk  # limit branching at traverser nodes for speed
+        self.rm_plus = bool(rm_plus)
+        bt = branch_topk  # limit branching at traverser nodes for speed
+        if bt is not None and int(bt) <= 0:
+            bt = None
+        self.branch_topk = bt
 
         # Memory controls
         self.max_infosets = int(max_infosets) if (max_infosets is not None and max_infosets > 0) else None
@@ -197,6 +202,20 @@ class CFRTrainer:
         self._clock: int = 0
         self.obs_key_mode = str(obs_key_mode)
         self.dtype = np.dtype(dtype)
+        if rng is None:
+            self.rng = Generator(PCG64(seed))
+        elif hasattr(rng, "choice"):
+            self.rng = rng
+        else:
+            try:
+                entropy = np.asarray(rng, dtype=np.uint64).tobytes()
+                if not entropy:
+                    raise ValueError("empty entropy")
+                digest = hashlib.sha1(entropy).digest()
+                seed_material = int.from_bytes(digest[:8], "little")
+            except Exception:
+                seed_material = int(seed)
+            self.rng = Generator(PCG64(seed_material & ((1 << 64) - 1)))
 
         # infoset -> arrays of size 40 (global card index space)
         self.cum_regret: Dict[Tuple[int, bytes], np.ndarray] = {}
@@ -248,7 +267,9 @@ class CFRTrainer:
         return float(t0 if (seat % 2 == 0) else t1)
 
     def _obs_key(self, obs: np.ndarray) -> bytes:
-        """Compact hash (16-byte BLAKE2b) for observation; may use a slice."""
+        """Bit-pack observation planes to bytes (exactly like SavedPolicy).
+        Full: 6×40 -> 30 bytes; compact: 3×40 -> 15B; hand_table: 2×40 -> 10B.
+        """
         mode = self.obs_key_mode
         if mode == "hand_table":
             obs_slice = obs[:2]
@@ -256,8 +277,12 @@ class CFRTrainer:
             obs_slice = obs[:3]
         else:
             obs_slice = obs
-        view = np.ascontiguousarray(obs_slice).view(np.uint8)
-        return hashlib.blake2b(view, digest_size=16).digest()
+        planes = (np.asarray(obs_slice, dtype=np.float32) > 0.5).astype(np.uint8)
+        packed = []
+        for plane in planes:
+            b = np.packbits(plane, bitorder="little")
+            packed.append(b[:5].tobytes())  # 40 bits -> 5 bytes
+        return b"".join(packed)
 
     def _infoset(self, st: NState, seat: int) -> Tuple[Tuple[int, bytes], np.ndarray]:
         """Return (infoset_key, legal_mask) for seat in state."""
@@ -329,6 +354,12 @@ class CFRTrainer:
             # Only actions we evaluated contribute; others stay at 0 for this visit
             regrets[branch_actions] = action_values[branch_actions] - util
             self.cum_regret[infoset_key] += regrets.astype(self.dtype)
+            if self.rm_plus:
+                # RM+: keep cumulative regrets non-negative for faster, stabler learning
+                self.cum_regret[infoset_key] = np.maximum(
+                    np.asarray(self.cum_regret[infoset_key], dtype=np.float32),
+                    0.0
+                ).astype(self.dtype)
             self.cum_strategy[infoset_key] += sigma.astype(self.dtype)
             return util
         else:
@@ -552,36 +583,45 @@ class CFRTrainer:
             out[f"avg_{k}"] = v * inv_eps
         return out
 
+    
     def train(self, iterations: int = 1000, seed: int = 42, verbose: bool = False, log_every: int = 100,
-              eval_every: Optional[int] = None, eval_episodes: int = 32, eval_use_avg_policy: bool = True):
-        # Independent RNG per iteration for deck
+            eval_every: Optional[int] = None, eval_episodes: int = 32, eval_use_avg_policy: bool = True,
+            batch_size: Optional[int] = None):
+        """Run MCCFR for a given number of iterations with mini-batching.
+
+        Each iteration samples B independent deals and accumulates regrets/strategy.
+        """
         for it in trange(1, iterations + 1, desc="Iter"):
-            rng = Generator(PCG64(seed + it))
-            st = np_init_state(rng)
+            B = int(batch_size) if (batch_size is not None) else int(getattr(self, "batch_size", 1))
+            if B <= 0:
+                B = 1
 
-            util0 = None
-            for target in range(4):
-                util = self._mccfr(st, target)
-                if target == 0:
-                    util0 = util
-                if verbose and it % max(log_every, 1) == 0 and target == 0:
-                    print(f"Iter {it}: util seat0 ~ {util:.3f}")
+            util0_acc = 0.0
+            for b in range(B):
+                rng = Generator(PCG64(seed + it * 100003 + b))
+                st = np_init_state(rng)
+                for target in range(4):
+                    util = self._mccfr(st, target)
+                    if target == 0:
+                        util0_acc += util
+                    if verbose and it % max(log_every, 1) == 0 and target == 0 and b == B - 1:
+                        print(f"Iter {it}: util seat0 (avg over {B}) ~ {util0_acc / float(B):.3f}")
 
-            if it % max(log_every, 1) == 0:
-                self._log_metrics(it, util0)
-                # Optional evaluation logging
-                do_eval = (eval_every is not None and eval_every > 0 and (it % eval_every == 0))
-                if do_eval and self.tlogger is not None:
-                    # Self-play evaluation
-                    selfplay_metrics = self.evaluate(episodes=eval_episodes, seed=seed + 7777 + it,
-                                                     selfplay=True, use_avg_policy=eval_use_avg_policy)
-                    for k, v in selfplay_metrics.items():
-                        self.tlogger.writer.add_scalar(f"EvalSelf/{k}", float(v), it)
-                    # Versus random evaluation (policy team on seats 0/2)
-                    vsrnd_metrics = self.evaluate(episodes=eval_episodes, seed=seed + 8888 + it,
-                                                  selfplay=False, use_avg_policy=eval_use_avg_policy)
-                    for k, v in vsrnd_metrics.items():
-                        self.tlogger.writer.add_scalar(f"EvalVsRandom/{k}", float(v), it)
+            if self.tlogger is not None and it % max(log_every, 1) == 0:
+                self._log_metrics(it, util0=util0_acc / float(B))
+
+            do_eval = (eval_every is not None and eval_every > 0 and (it % eval_every == 0))
+            if do_eval and self.tlogger is not None:
+                selfplay_metrics = self.evaluate(episodes=eval_episodes, seed=seed + 7777 + it,
+                                                selfplay=True, use_avg_policy=eval_use_avg_policy)
+                for k, v in selfplay_metrics.items():
+                    self.tlogger.writer.add_scalar(f"EvalSelf/{k}", float(v), it)
+
+                vsrnd_metrics = self.evaluate(episodes=eval_episodes, seed=seed + 8888 + it,
+                                            selfplay=False, use_avg_policy=eval_use_avg_policy)
+                for k, v in vsrnd_metrics.items():
+                    self.tlogger.writer.add_scalar(f"EvalVsRandom/{k}", float(v), it)
+
 
     def get_average_policy(self) -> Dict[Tuple[int, bytes], np.ndarray]:
         policy = {}
@@ -623,7 +663,7 @@ class CFRTrainer:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         if kind == "avg":
             policy = self.get_average_policy()
-            payload = {"type": "avg_policy", "policy": policy}
+            payload = {"type": "avg_policy", "policy": policy, "obs_key_mode": getattr(self, "obs_key_mode", "full")}
         elif kind == "full":
             payload = {
                 "type": "full",
@@ -640,18 +680,22 @@ class CFRTrainer:
             pickle.dump(payload, f)
 
     @staticmethod
+    
     def load_avg_policy(path: str, seed: int = 0) -> "SavedPolicy":
         with open(path, "rb") as f:
             payload = pickle.load(f)
         if payload.get("type") == "avg_policy":
             policy = payload["policy"]
+            mode = payload.get("obs_key_mode", "full")
         elif payload.get("type") == "full":
             tmp = CFRTrainer(seed=seed)
             tmp.cum_strategy = payload["cum_strategy"]
             policy = tmp.get_average_policy()
+            mode = getattr(tmp, "obs_key_mode", "full")
         else:
             raise ValueError("Unsupported payload for avg policy load")
-        return SavedPolicy(policy_map=policy, seed=seed)
+        return SavedPolicy(policy_map=policy, seed=seed, obs_key_mode=mode)
+
 
     @staticmethod
     def load_trainer(path: str, tlogger: Optional[object] = None, seed: int = 0) -> "CFRTrainer":
@@ -669,11 +713,28 @@ class CFRTrainer:
         return tr
 
 
+
 class SavedPolicy:
     """Lightweight actor for a saved average policy map."""
-    def __init__(self, policy_map: Dict[Tuple[int, bytes], np.ndarray], seed: int = 0):
+    def __init__(self, policy_map: Dict[Tuple[int, bytes], np.ndarray], seed: int = 0, obs_key_mode: str = "full"):
         self.policy_map = policy_map
         self.rng = Generator(PCG64(seed))
+        self.obs_key_mode = str(obs_key_mode)
+
+    def _obs_key(self, seat: int, obs: np.ndarray) -> Tuple[int, bytes]:
+        mode = self.obs_key_mode
+        if mode == "hand_table":
+            obs_slice = obs[:2]
+        elif mode == "compact":
+            obs_slice = obs[:3]
+        else:
+            obs_slice = obs
+        planes = (np.asarray(obs_slice, dtype=np.float32) > 0.5).astype(np.uint8)
+        packed = []
+        for plane in planes:
+            b = np.packbits(plane, bitorder="little")  # 40->5 bytes
+            packed.append(b[:5].tobytes())
+        return (seat, b"".join(packed))
 
     def act(self, seat: int, obs: np.ndarray) -> int:
         """Sample an action from the saved average policy, restricted to legal."""
@@ -681,11 +742,24 @@ class SavedPolicy:
         legal_idx = np.nonzero(legal)[0]
         if legal_idx.size == 0:
             return 0
-        # Use same compact keying as trainer
-        key = (seat, hashlib.blake2b(obs.view(np.uint8), digest_size=16).digest())
-        probs = self.policy_map.get(key)
+
+        # Try the configured keying first, then fallbacks
+        keys = [self._obs_key(seat, obs)]
+        for alt in ("compact", "hand_table", "full"):
+            if alt != self.obs_key_mode:
+                old = self.obs_key_mode
+                self.obs_key_mode = alt
+                keys.append(self._obs_key(seat, obs))
+                self.obs_key_mode = old
+
+        probs = None
+        for k in keys:
+            probs = self.policy_map.get(k)
+            if probs is not None:
+                break
         if probs is None:
             return int(self.rng.choice(legal_idx))
+
         p = np.asarray(probs, dtype=np.float64)[legal_idx]
         s = float(p.sum())
         if s <= 0.0 or not np.isfinite(s):

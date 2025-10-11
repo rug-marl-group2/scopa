@@ -4,7 +4,7 @@ using a JAX-based implementation. It logs training metrics, optionally evaluates
 the resulting policy, and previews gameplay using both random and learned strategies.        
 
 Example Usage:
-    python scopa/src/train_cfr.py --iters 5000 --log_every 10 --eval_every 100 --eval_eps 64 --eval_policy avg --save_kind avg --branch_topk 1 --max_infosets 300000 --obs_key_mode compact
+    python scopa/src/train_cfr.py --iters 2500 --log_every 10 --eval_every 100 --eval_eps 64 --eval_policy current --save_kind current --branch_topk 1 --max_infosets 250000
 """
 
 
@@ -88,15 +88,17 @@ def preview_game(env, policy: str, trainer: Optional[CFRTrainer]):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--iters", type=int, default=1000)
+    parser.add_argument("--batch_size", type=int, default=8, help="Deals per iteration for MCCFR mini-batch")
+    parser.add_argument("--rm_plus", action="store_true", default=True, help="Use RM+ (regret clamping)")
     parser.add_argument("--seed", type=int, default=time.time_ns())
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--log_every", type=int, default=100)
-    parser.add_argument("--branch_topk", type=int, default=3, help="Limit traverser branching to top-K actions by current policy (speed boost)")
+    parser.add_argument("--branch_topk", type=int, default=0, help="Limit traverser branching to top-K actions by current policy; 0 disables pruning (full branching, correct CFR)")
     parser.add_argument("--preview_random", type=int, default=1, help="Show this many random games after training")
     parser.add_argument("--preview_policy", type=int, default=1, help="Show this many policy games after training")
     parser.add_argument("--eval_every", type=int, default=100, help="Evaluate and log game metrics every N iters (0 to disable)")
     parser.add_argument("--eval_eps", type=int, default=64, help="Episodes per evaluation mode")
-    parser.add_argument("--eval_policy", type=str, default="avg", choices=["avg", "current"], help="Which policy to use for evaluation")
+    parser.add_argument("--eval_policy", type=str, default="current", choices=["avg", "current"], help="Which policy to use for evaluation")
     parser.add_argument("--max_infosets", type=int, default=0, help="Cap the number of stored infosets (0 = unlimited)")
     parser.add_argument("--obs_key_mode", type=str, default="full", choices=["full", "compact", "hand_table"], help="How much of the observation to hash for infoset keys")
     parser.add_argument("--table_dtype", type=str, default="float16", choices=["float16", "float32"], help="Data type for regret/strategy tables to reduce memory")
@@ -112,8 +114,10 @@ def main():
                          tlogger=tlog,
                          branch_topk=args.branch_topk,
                          max_infosets=(args.max_infosets if args.max_infosets and args.max_infosets > 0 else None),
+                         dtype=dtype_map.get(args.table_dtype, np.float16),
                          obs_key_mode=args.obs_key_mode,
-                         dtype=dtype_map.get(args.table_dtype, np.float16))
+                         rm_plus=args.rm_plus
+                         )
     trainer.train(
         iterations=args.iters,
         seed=args.seed,
@@ -122,6 +126,7 @@ def main():
         eval_every=args.eval_every if args.eval_every > 0 else None,
         eval_episodes=args.eval_eps,
         eval_use_avg_policy=(args.eval_policy == "avg"),
+        batch_size=args.batch_size
     )
 
     # Save trained model/policy (default inside run dir)
