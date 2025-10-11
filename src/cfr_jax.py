@@ -209,7 +209,8 @@ class CFRTrainer:
                  progressive_widening: bool = True, pw_alpha: float = 0.3, pw_tail: int = 3,
                  regret_prune: bool = True, prune_threshold: float = -0.05,
                  prune_warmup: int = 32, prune_reactivation: int = 8,
-                 subset_cache_size: int = 8192):
+                 subset_cache_size: int = 8192, max_branch_actions: int = 0,
+                 rollout_depth: int = 0, rollout_samples: int = 0):
         self.tlogger = tlogger
         self.rm_plus = bool(rm_plus)
         bt = branch_topk  # limit branching at traverser nodes for speed
@@ -226,6 +227,14 @@ class CFRTrainer:
         self._infoset_visits: Dict[Tuple[int, bytes], int] = {}
         self._subset_cache: OrderedDict[Tuple[int, bytes], np.ndarray] = OrderedDict()
         self._subset_cache_cap = max(int(subset_cache_size), 0)
+        mba = int(max_branch_actions) if (max_branch_actions and max_branch_actions > 0) else None
+        if mba is not None and self.branch_topk is not None:
+            self.branch_topk = min(self.branch_topk, mba)
+        self.max_branch_actions = mba
+        rd = int(rollout_depth) if (rollout_depth and rollout_depth > 0) else None
+        self.rollout_depth = rd
+        self.rollout_samples = max(int(rollout_samples), 1) if rd is not None else 0
+        self._max_rollout_steps = NUM_CARDS * 2
 
         # Memory controls
         self.max_infosets = int(max_infosets) if (max_infosets is not None and max_infosets > 0) else None
@@ -311,43 +320,53 @@ class CFRTrainer:
         pruned = self._apply_regret_pruning(infoset_key, actions, visit_count)
         if pruned.size > 0:
             actions = pruned
-        if self.branch_topk is None or actions.size <= self.branch_topk:
-            return actions
-        probs_masked = sigma[actions]
-        width = self.branch_topk
-        if self.progressive_widening:
-            extra = int(np.power(max(visit_count - 1, 0), self.pw_alpha))
-            width = min(actions.size, self.branch_topk + extra)
-        if width >= actions.size:
-            return actions
-        top_idx = np.argpartition(probs_masked, -width)[-width:]
-        selected = actions[top_idx]
-        if self.progressive_widening and width < actions.size:
-            tail_mask = np.ones(actions.size, dtype=bool)
-            tail_mask[top_idx] = False
-            tail_actions = actions[tail_mask]
-            if tail_actions.size > 0:
-                tail_probs = np.clip(probs_masked[tail_mask], 0.0, None).astype(np.float64)
-                total = float(tail_probs.sum())
-                if total <= 0.0 or not np.isfinite(total):
-                    tail_probs = np.full(tail_actions.size, 1.0 / tail_actions.size, dtype=np.float64)
-                else:
-                    tail_probs /= total
-                    adjust = 1.0 - float(tail_probs.sum())
-                    if abs(adjust) > 1e-15:
-                        tail_probs[-1] += adjust
-                    tail_probs = np.clip(tail_probs, 0.0, 1.0)
-                    s2 = float(tail_probs.sum())
-                    if s2 <= 0.0 or not np.isfinite(s2):
+        effective_limit = self.branch_topk
+        if effective_limit is None and self.max_branch_actions is not None:
+            effective_limit = self.max_branch_actions
+        if effective_limit is None or actions.size <= effective_limit:
+            selected = actions
+        else:
+            probs_masked = sigma[actions]
+            width = min(actions.size, effective_limit)
+            if self.progressive_widening:
+                extra = int(np.power(max(visit_count - 1, 0), self.pw_alpha))
+                width = min(actions.size, effective_limit + extra)
+            if self.max_branch_actions is not None:
+                width = min(width, self.max_branch_actions)
+            top_idx = np.argpartition(probs_masked, -width)[-width:]
+            selected = actions[top_idx]
+            if self.progressive_widening and width < actions.size:
+                tail_mask = np.ones(actions.size, dtype=bool)
+                tail_mask[top_idx] = False
+                tail_actions = actions[tail_mask]
+                if tail_actions.size > 0:
+                    tail_probs = np.clip(probs_masked[tail_mask], 0.0, None).astype(np.float64)
+                    total = float(tail_probs.sum())
+                    if total <= 0.0 or not np.isfinite(total):
                         tail_probs = np.full(tail_actions.size, 1.0 / tail_actions.size, dtype=np.float64)
                     else:
-                        tail_probs /= s2
-                samples = min(tail_actions.size, max(self.pw_tail, 1) + int(np.log1p(visit_count)))
-                if samples > 0:
-                    idx = self.rng.choice(tail_actions.size, size=samples, replace=False, p=tail_probs)
-                    sampled = tail_actions[np.atleast_1d(idx)]
-                    selected = np.unique(np.concatenate([selected, sampled.astype(selected.dtype)]))
-        return selected
+                        tail_probs /= total
+                        adjust = 1.0 - float(tail_probs.sum())
+                        if abs(adjust) > 1e-15:
+                            tail_probs[-1] += adjust
+                        tail_probs = np.clip(tail_probs, 0.0, 1.0)
+                        s2 = float(tail_probs.sum())
+                        if s2 <= 0.0 or not np.isfinite(s2):
+                            tail_probs = np.full(tail_actions.size, 1.0 / tail_actions.size, dtype=np.float64)
+                        else:
+                            tail_probs /= s2
+                    samples = min(tail_actions.size, max(self.pw_tail, 1) + int(np.log1p(visit_count)))
+                    if self.max_branch_actions is not None:
+                        samples = min(samples, max(self.max_branch_actions - selected.size, 0))
+                    if samples > 0:
+                        idx = self.rng.choice(tail_actions.size, size=samples, replace=False, p=tail_probs)
+                        sampled = tail_actions[np.atleast_1d(idx)]
+                        selected = np.concatenate([selected, sampled.astype(selected.dtype)])
+        if self.max_branch_actions is not None and selected.size > self.max_branch_actions:
+            probs_sel = sigma[selected]
+            keep_idx = np.argpartition(probs_sel, -self.max_branch_actions)[-self.max_branch_actions:]
+            selected = selected[keep_idx]
+        return np.sort(np.unique(selected))
 
     def _apply_action_inplace(self, st: NState, action_idx: int) -> ActionDiff:
         seat = int(st.cur_player)
@@ -419,6 +438,33 @@ class CFRTrainer:
             st.captures[seat, diff.captures_indices] -= 1
         if diff.scopa_delta:
             st.scopas[seat] -= diff.scopa_delta
+
+    def _estimate_rollout_value(self, st: NState, target_seat: int, rng: Generator) -> float:
+        samples = max(self.rollout_samples, 1) if self.rollout_samples else 1
+        total = 0.0
+        for _ in range(samples):
+            trace: list[ActionDiff] = []
+            steps = 0
+            while not np_is_terminal(st) and steps < self._max_rollout_steps:
+                cur = int(st.cur_player)
+                obs = np_build_obs(st, cur)
+                legal_mask = (obs[0] > 0).astype(np.int32)
+                legal_actions = np.nonzero(legal_mask)[0]
+                if legal_actions.size == 0:
+                    break
+                if cur == target_seat:
+                    infoset_key = (cur, self._obs_key(obs))
+                    sigma = self._get_strategy(infoset_key, legal_mask)
+                    action = int(self._safe_sample(sigma, legal_mask, rng))
+                else:
+                    action = int(rng.choice(legal_actions))
+                diff = self._apply_action_inplace(st, action)
+                trace.append(diff)
+                steps += 1
+            total += self._evaluate_utility(st, target_seat)
+            while trace:
+                self._undo_action(st, trace.pop())
+        return total / float(samples)
 
     def _safe_sample(self, p_arr: np.ndarray, legal_mask: np.ndarray, rng: Optional[Generator] = None,
                      return_prob: bool = False) -> Union[int, Tuple[int, float]]:
@@ -513,13 +559,17 @@ class CFRTrainer:
     def _mccfr(self, st: NState, target_seat: int,
                reach_my: float = 1.0,
                reach_others: float = 1.0,
-               sample_reach: float = 1.0) -> float:
+               sample_reach: float = 1.0,
+               depth: int = 0) -> float:
         """Recursive MCCFR traversal optimizing `target_seat` with importance weighting."""
         if np_is_terminal(st):
             payoff = self._evaluate_utility(st, target_seat)
             if sample_reach <= 0.0:
                 return payoff
             return float(reach_others / sample_reach) * payoff
+
+        if self.rollout_depth is not None and depth >= self.rollout_depth:
+            return self._estimate_rollout_value(st, target_seat, self.rng)
 
         cur_seat = int(st.cur_player)
         infoset_key, legal_mask = self._infoset(st, cur_seat)
@@ -545,6 +595,7 @@ class CFRTrainer:
                     reach_my=reach_my * prob,
                     reach_others=reach_others,
                     sample_reach=sample_reach,
+                    depth=depth + 1,
                 )
                 self._undo_action(st, diff)
                 action_values[a_int] = v
@@ -592,6 +643,7 @@ class CFRTrainer:
             reach_my=reach_my,
             reach_others=reach_others * sample_prob,
             sample_reach=sample_reach * sample_prob,
+            depth=depth + 1,
         )
         self._undo_action(st, diff)
         return value
@@ -893,6 +945,9 @@ class CFRTrainer:
                 "prune_warmup": self.prune_warmup,
                 "prune_reactivation": self.prune_reactivation,
                 "subset_cache_size": self._subset_cache_cap,
+                "max_branch_actions": self.max_branch_actions,
+                "rollout_depth": self.rollout_depth,
+                "rollout_samples": self.rollout_samples,
             }
         else:
             raise ValueError(f"Unknown save kind: {kind}")
@@ -935,7 +990,10 @@ class CFRTrainer:
                         prune_threshold=float(payload.get("prune_threshold", -1.0)),
                         prune_warmup=int(payload.get("prune_warmup", 64)),
                         prune_reactivation=int(payload.get("prune_reactivation", 16)),
-                        subset_cache_size=int(payload.get("subset_cache_size", 4096)))
+                        subset_cache_size=int(payload.get("subset_cache_size", 4096)),
+                        max_branch_actions=int(payload.get("max_branch_actions", 0)),
+                        rollout_depth=int(payload.get("rollout_depth", 0)),
+                        rollout_samples=int(payload.get("rollout_samples", 0)))
         tr.cum_regret = payload["cum_regret"]
         tr.cum_strategy = payload["cum_strategy"]
         return tr

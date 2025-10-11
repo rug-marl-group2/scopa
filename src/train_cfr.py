@@ -94,8 +94,17 @@ def main():
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--log_every", type=int, default=100)
     parser.add_argument("--branch_topk", type=int, default=5, help="Limit traverser branching to top-K actions by current policy; 0 disables pruning (full branching, correct CFR)")
-    parser.add_argument("--preview_random", type=int, default=1, help="Show this many random games after training")
-    parser.add_argument("--preview_policy", type=int, default=1, help="Show this many policy games after training")
+    parser.add_argument("--max_branch_actions", type=int, default=4, help="Hard cap on traverser actions explored per infoset (0 = unlimited)")
+    parser.add_argument("--pw_alpha", type=float, default=0.3, help="Progressive widening growth exponent")
+    parser.add_argument("--pw_tail", type=int, default=3, help="Base number of tail actions sampled alongside top-K")
+    parser.add_argument("--prune_threshold", type=float, default=-0.05, help="Regret pruning threshold (actions below are skipped)")
+    parser.add_argument("--prune_warmup", type=int, default=32, help="Number of visits before regret pruning engages")
+    parser.add_argument("--prune_reactivation", type=int, default=8, help="Force reconsideration of pruned actions every N visits")
+    parser.add_argument("--subset_cache_size", type=int, default=8192, help="LRU cache size for subset-sum table solves (0 disables)")
+    parser.add_argument("--rollout_depth", type=int, default=14, help="Depth at which to switch to random rollout evaluation (0 = disabled)")
+    parser.add_argument("--rollout_samples", type=int, default=6, help="Number of rollouts used when depth cutoff triggers")
+    parser.add_argument("--preview_random", type=int, default=0, help="Show this many random games after training")
+    parser.add_argument("--preview_policy", type=int, default=0, help="Show this many policy games after training")
     parser.add_argument("--eval_every", type=int, default=100, help="Evaluate and log game metrics every N iters (0 to disable)")
     parser.add_argument("--eval_eps", type=int, default=64, help="Episodes per evaluation mode")
     parser.add_argument("--eval_policy", type=str, default="current", choices=["avg", "current"], help="Which policy to use for evaluation")
@@ -112,11 +121,22 @@ def main():
     dtype_map = {"float16": np.float16, "float32": np.float32}
     trainer = CFRTrainer(seed=args.seed,
                          tlogger=tlog,
-                         branch_topk=args.branch_topk,
+                         branch_topk=args.branch_topk if args.branch_topk > 0 else None,
                          max_infosets=(args.max_infosets if args.max_infosets and args.max_infosets > 0 else None),
                          dtype=dtype_map.get(args.table_dtype, np.float16),
                          obs_key_mode=args.obs_key_mode,
-                         rm_plus=args.rm_plus
+                         rm_plus=args.rm_plus,
+                         progressive_widening=True,
+                         pw_alpha=args.pw_alpha,
+                         pw_tail=args.pw_tail,
+                         regret_prune=True,
+                         prune_threshold=args.prune_threshold,
+                         prune_warmup=args.prune_warmup,
+                         prune_reactivation=args.prune_reactivation,
+                         subset_cache_size=args.subset_cache_size,
+                         max_branch_actions=args.max_branch_actions,
+                         rollout_depth=args.rollout_depth,
+                         rollout_samples=args.rollout_samples
                          )
     trainer.train(
         iterations=args.iters,
