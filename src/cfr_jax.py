@@ -1,4 +1,4 @@
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple, Optional, Union
 import os
 import pickle
 
@@ -201,7 +201,14 @@ class CFRTrainer:
         self._last_seen: Dict[Tuple[int, bytes], int] = {}
         self._clock: int = 0
         self.obs_key_mode = str(obs_key_mode)
-        self.dtype = np.dtype(dtype)
+        table_dtype = np.dtype(dtype)
+        self.dtype = table_dtype
+        # Float16 accumulators are numerically unstable once reach weights get large
+        # (sample_reach can be < 1e-6), so promote to at least float32 for storage.
+        accum_dtype = np.dtype(np.float32)
+        if table_dtype.itemsize >= accum_dtype.itemsize:
+            accum_dtype = table_dtype
+        self.accum_dtype = accum_dtype
         if rng is None:
             self.rng = Generator(PCG64(seed))
         elif hasattr(rng, "choice"):
@@ -224,8 +231,8 @@ class CFRTrainer:
     def _get_strategy(self, infoset_key, legal_mask: np.ndarray) -> np.ndarray:
         """Fetch/init tables for the given infoset and compute policy."""
         if infoset_key not in self.cum_regret:
-            self.cum_regret[infoset_key] = np.zeros((NUM_CARDS,), dtype=self.dtype)
-            self.cum_strategy[infoset_key] = np.zeros((NUM_CARDS,), dtype=self.dtype)
+            self.cum_regret[infoset_key] = np.zeros((NUM_CARDS,), dtype=self.accum_dtype)
+            self.cum_strategy[infoset_key] = np.zeros((NUM_CARDS,), dtype=self.accum_dtype)
             self._touch_key(infoset_key)
             self._evict_if_needed(avoid_key=infoset_key)
         else:
@@ -233,34 +240,55 @@ class CFRTrainer:
         # Use float32 math for stability
         return regret_matching(np.asarray(self.cum_regret[infoset_key], dtype=np.float32), legal_mask.astype(np.float32))
 
-    def _safe_sample(self, p_arr: np.ndarray, legal_mask: np.ndarray, rng: Optional[Generator] = None) -> int:
+    def _safe_sample(self, p_arr: np.ndarray, legal_mask: np.ndarray, rng: Optional[Generator] = None,
+                     return_prob: bool = False) -> Union[int, Tuple[int, float]]:
         """Sample an action robustly over the legal set.
 
         - Works on the restricted legal index set to avoid tiny normalization errors.
         - Falls back to uniform legal if probabilities are degenerate.
+        - Optionally returns the probability used for sampling the chosen action.
         """
         if rng is None:
             rng = self.rng
         lm = (legal_mask > 0).astype(np.int32)
         legal_idx = np.nonzero(lm)[0]
         if legal_idx.size == 0:
-            return 0
+            return (0, 1.0) if return_prob else 0
+
         p = np.asarray(p_arr, dtype=np.float64)[legal_idx]
         s = float(p.sum())
         if s <= 0.0 or not np.isfinite(s):
-            return int(rng.choice(legal_idx))
-        p /= s
-        # Correct any tiny drift
-        adjust = 1.0 - float(p.sum())
-        if abs(adjust) > 1e-15:
-            p[-1] += adjust
-        # Clip and renormalize for safety
-        p = np.clip(p, 0.0, 1.0)
-        s2 = float(p.sum())
-        if s2 <= 0.0 or not np.isfinite(s2):
-            return int(rng.choice(legal_idx))
-        p /= s2
-        return int(rng.choice(legal_idx, p=p))
+            probs = np.full(legal_idx.size, 1.0 / float(legal_idx.size), dtype=np.float64)
+        else:
+            p /= s
+            adjust = 1.0 - float(p.sum())
+            if abs(adjust) > 1e-15:
+                p[-1] += adjust
+            p = np.clip(p, 0.0, 1.0)
+            s2 = float(p.sum())
+            if s2 <= 0.0 or not np.isfinite(s2):
+                probs = np.full(legal_idx.size, 1.0 / float(legal_idx.size), dtype=np.float64)
+            else:
+                p /= s2
+                probs = p
+
+        choice_idx = int(rng.choice(legal_idx.size, p=probs))
+        choice = int(legal_idx[choice_idx])
+        if return_prob:
+            return choice, float(probs[choice_idx])
+        return choice
+
+    def _clone_state(self, st: NState) -> NState:
+        """Create a copy-on-write clone of the given state."""
+        st_next = NState()
+        st_next.hands = st.hands.copy()
+        st_next.table = st.table.copy()
+        st_next.captures = st.captures.copy()
+        st_next.history = st.history.copy()
+        st_next.scopas = st.scopas.copy()
+        st_next.cur_player = st.cur_player
+        st_next.last_capture_player = st.last_capture_player
+        return st_next
 
     def _evaluate_utility(self, st: NState, seat: int) -> float:
         t0, t1 = np_evaluate_round(st)
@@ -314,10 +342,16 @@ class CFRTrainer:
             self.cum_strategy.pop(to_evict, None)
             self._last_seen.pop(to_evict, None)
 
-    def _mccfr(self, st: NState, target_seat: int) -> float:
-        """Recursive MCCFR traversal optimizing `target_seat`."""
+    def _mccfr(self, st: NState, target_seat: int,
+               reach_my: float = 1.0,
+               reach_others: float = 1.0,
+               sample_reach: float = 1.0) -> float:
+        """Recursive MCCFR traversal optimizing `target_seat` with importance weighting."""
         if np_is_terminal(st):
-            return self._evaluate_utility(st, target_seat)
+            payoff = self._evaluate_utility(st, target_seat)
+            if sample_reach <= 0.0:
+                return payoff
+            return float(reach_others / sample_reach) * payoff
 
         cur_seat = int(st.cur_player)
         infoset_key, legal_mask = self._infoset(st, cur_seat)
@@ -328,61 +362,55 @@ class CFRTrainer:
             # Traverser: deterministically branch over legal actions
             action_values = np.zeros(NUM_CARDS, dtype=np.float32)
             util = 0.0
-            # Optionally limit branching to top-K by current policy
             branch_actions = legal_actions
             if self.branch_topk is not None and self.branch_topk > 0 and branch_actions.size > self.branch_topk:
                 probs_masked = sigma[branch_actions]
                 top_idx = np.argsort(probs_masked)[-self.branch_topk:]
                 branch_actions = branch_actions[top_idx]
             for a in branch_actions:
-                # Copy-on-write lightweight state
-                st_next = NState()
-                st_next.hands = st.hands.copy()
-                st_next.table = st.table.copy()
-                st_next.captures = st.captures.copy()
-                st_next.history = st.history.copy()
-                st_next.scopas = st.scopas.copy()
-                st_next.cur_player = st.cur_player
-                st_next.last_capture_player = st.last_capture_player
-
+                prob = float(sigma[int(a)])
+                st_next = self._clone_state(st)
                 st_next, _ = np_step(st_next, int(a))
-                v = self._mccfr(st_next, target_seat)
+                v = self._mccfr(
+                    st_next,
+                    target_seat,
+                    reach_my=reach_my * max(prob, 0.0),
+                    reach_others=reach_others,
+                    sample_reach=sample_reach,
+                )
                 action_values[int(a)] = v
-                util += float(sigma[int(a)]) * float(v)
+                util += prob * float(v)
 
+            weight = reach_others / max(sample_reach, 1e-12)
             regrets = np.zeros(NUM_CARDS, dtype=np.float32)
-            # Only actions we evaluated contribute; others stay at 0 for this visit
-            regrets[branch_actions] = action_values[branch_actions] - util
-            self.cum_regret[infoset_key] += regrets.astype(self.dtype)
+            regrets[branch_actions] = (action_values[branch_actions] - util) * float(weight)
+            self.cum_regret[infoset_key] += regrets.astype(self.accum_dtype)
             if self.rm_plus:
-                # RM+: keep cumulative regrets non-negative for faster, stabler learning
                 self.cum_regret[infoset_key] = np.maximum(
                     np.asarray(self.cum_regret[infoset_key], dtype=np.float32),
                     0.0
-                ).astype(self.dtype)
-            self.cum_strategy[infoset_key] += sigma.astype(self.dtype)
+                ).astype(self.accum_dtype)
+
+            strategy_weight = reach_my / max(sample_reach, 1e-12)
+            self.cum_strategy[infoset_key] += (sigma * strategy_weight).astype(self.accum_dtype)
             return util
-        else:
-            # Others: external sampling from current policy
-            a = self._safe_sample(sigma, legal_mask, self.rng)
 
-            st_next = NState()
-            st_next.hands = st.hands.copy()
-            st_next.table = st.table.copy()
-            st_next.captures = st.captures.copy()
-            st_next.history = st.history.copy()
-            st_next.scopas = st.scopas.copy()
-            st_next.cur_player = st.cur_player
-            st_next.last_capture_player = st.last_capture_player
+        # Other seats: external sampling from current policy
+        action, sample_prob = self._safe_sample(sigma, legal_mask, self.rng, return_prob=True)
+        sample_prob = float(sample_prob)
+        if sample_prob <= 0.0:
+            sample_prob = 1.0 / max(legal_actions.size, 1)
 
-            st_next, _ = np_step(st_next, a)
-            # Track average strategy
-            if infoset_key not in self.cum_strategy:
-                self.cum_strategy[infoset_key] = np.zeros((NUM_CARDS,), dtype=self.dtype)
-                self._touch_key(infoset_key)
-                self._evict_if_needed(avoid_key=infoset_key)
-            self.cum_strategy[infoset_key] += sigma.astype(self.dtype)
-            return self._mccfr(st_next, target_seat)
+        st_next = self._clone_state(st)
+        st_next, _ = np_step(st_next, int(action))
+
+        return self._mccfr(
+            st_next,
+            target_seat,
+            reach_my=reach_my,
+            reach_others=reach_others * sample_prob,
+            sample_reach=sample_reach * sample_prob,
+        )
 
     def _metrics_snapshot(self) -> Dict[str, float]:
         n_infosets = float(len(self.cum_regret))
@@ -646,7 +674,7 @@ class CFRTrainer:
         infoset_key = (seat, self._obs_key(obs))
         legal = (obs[0] > 0).astype(np.int32)
         if infoset_key not in self.cum_regret:
-            self.cum_regret[infoset_key] = np.zeros((NUM_CARDS,), dtype=self.dtype)
+            self.cum_regret[infoset_key] = np.zeros((NUM_CARDS,), dtype=self.accum_dtype)
         probs = regret_matching(self.cum_regret[infoset_key], legal.astype(np.float32))
         return self._safe_sample(probs, legal, self.rng)
 
