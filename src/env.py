@@ -258,6 +258,15 @@ class MaScopaEnv(AECEnv):
         self.possible_agents = [player.name for player in self.game.players]
         self.agent_name_mapping = {agent: int(agent[-1]) for  agent in self.possible_agents}
 
+        self._suit_offset = {
+            'cuori': 0,
+            'picche': 10,
+            'fiori': 20,
+            'bello': 30,
+        }
+        players = len(self.game.players)
+        self.global_state_dim = (players * 3 * 40) + 40 + (players * 2)
+
         self._action_spaces = {
             #agent: spaces.Box(0, 1, shape=(1,40)) for agent in self.possible_agents
             agent: spaces.Discrete(40) for agent in self.possible_agents
@@ -273,6 +282,27 @@ class MaScopaEnv(AECEnv):
 
     def action_space(self, agent):
         return self._action_spaces[agent]
+
+    def _encode_cards(self, cards):
+        vec = np.zeros(40, dtype=np.float32)
+        for card in cards:
+            index = (card.rank - 1) + self._suit_offset[card.suit]
+            vec[index] += 1.0
+        return vec
+
+    def get_global_state(self):
+        """Return a flat global state vector for centralized critics."""
+        hands = [self._encode_cards(player.hand) for player in self.game.players]
+        table = self._encode_cards(self.game.table)
+        captures = [self._encode_cards(player.captures) for player in self.game.players]
+        history = [self._encode_cards(player.history) for player in self.game.players]
+        scopas = np.asarray([player.scopas for player in self.game.players], dtype=np.float32)
+        current = np.zeros(len(self.game.players), dtype=np.float32)
+        if getattr(self, 'agent_selection', None) in self.agent_name_mapping:
+            current_index = self.agent_name_mapping[self.agent_selection]
+            current[current_index] = 1.0
+        feature_list = hands + [table] + captures + history + [scopas, current]
+        return np.concatenate(feature_list).astype(np.float32, copy=False)
 
     def observe(self, agent):
         player_index = self.agent_name_mapping[agent]
