@@ -208,3 +208,4 @@ __marimo__/
 
 # related to repo
 .DS_Store
+*runs*
