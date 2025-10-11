@@ -111,8 +111,9 @@ def _apply_capture(state: State, seat: jnp.ndarray, subset_mask: jnp.ndarray, in
     if include_action:
         captured_mask = captured_mask.at[action_idx].set(1)
     table_after = state.table * (1 - subset_mask.astype(jnp.int8))
+    captured_any = jnp.any(subset_mask)
     captures_after = state.captures.at[seat].set(state.captures[seat] + captured_mask)
-    scopa_happened = (jnp.sum(table_after) == 0)
+    scopa_happened = (jnp.sum(table_after) == 0) & captured_any
     scopas_after = state.scopas.at[seat].set(state.scopas[seat] + scopa_happened.astype(jnp.int32))
     state2 = State(
         state.hands,
@@ -190,10 +191,23 @@ def build_observation(state: State, seat: jnp.ndarray) -> jnp.ndarray:
 
 @jax.jit
 def evaluate_round(state: State) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    # Remaining table cards go to the last player who captured (if any)
+    def _award_table(captures):
+        extra = state.table.astype(jnp.int8)
+        updated = jnp.clip(captures[state.last_capture_player] + extra, 0, 1)
+        return captures.at[state.last_capture_player].set(updated)
+
+    captures = lax.cond(
+        state.last_capture_player >= 0,
+        _award_table,
+        lambda caps: caps,
+        state.captures,
+    )
+
     # Team captures
     team0_mask, team1_mask = split_teams()
-    team0_caps = (state.captures.T @ team0_mask).astype(jnp.int32)  # [40]
-    team1_caps = (state.captures.T @ team1_mask).astype(jnp.int32)
+    team0_caps = (captures.T @ team0_mask).astype(jnp.int32)  # [40]
+    team1_caps = (captures.T @ team1_mask).astype(jnp.int32)
 
     team0_points = jnp.array(0, dtype=jnp.int32)
     team1_points = jnp.array(0, dtype=jnp.int32)
