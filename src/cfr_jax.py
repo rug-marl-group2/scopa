@@ -279,7 +279,18 @@ class CFRTrainer:
             self._touch_key(infoset_key)
         # Use float32 math for stability
         return regret_matching(np.asarray(self.cum_regret[infoset_key], dtype=np.float32), legal_mask.astype(np.float32))
-
+    
+    def _peek_strategy(self, infoset_key: Tuple[int, bytes], legal_mask: np.ndarray) -> np.ndarray:
+        """Return the current policy without creating state for unseen infosets."""
+        if infoset_key in self.cum_regret:
+            regrets = np.asarray(self.cum_regret[infoset_key], dtype=np.float32)
+            return regret_matching(regrets, legal_mask.astype(np.float32))
+        legal = legal_mask.astype(np.float32)
+        total = float(legal.sum())
+        if total <= 0.0:
+            return legal
+        return legal / total
+    
     def _subset_sum_mask_cached(self, table: np.ndarray, target_rank: int) -> np.ndarray:
         if target_rank <= 0:
             return np.zeros((NUM_CARDS,), dtype=bool)
@@ -313,6 +324,48 @@ class CFRTrainer:
             return actions[keep_mask]
         return actions
 
+    def _sample_weighted_subset(self, choices: np.ndarray, weights: np.ndarray, k: int) -> np.ndarray:
+        if choices.size == 0 or k <= 0:
+            return np.empty((0,), dtype=choices.dtype)
+        probs = np.clip(np.asarray(weights, dtype=np.float64), 0.0, None)
+        total = float(probs.sum())
+        if total <= 0.0 or not np.isfinite(total):
+            probs = np.full(choices.size, 1.0 / float(choices.size), dtype=np.float64)
+        else:
+            probs /= total
+            adjust = 1.0 - float(probs.sum())
+            if abs(adjust) > 1e-15:
+                probs[-1] += adjust
+            probs = np.clip(probs, 0.0, 1.0)
+            norm = float(probs.sum())
+            if norm <= 0.0 or not np.isfinite(norm):
+                probs = np.full(choices.size, 1.0 / float(choices.size), dtype=np.float64)
+            else:
+                probs /= norm
+        idx = self.rng.choice(choices.size, size=min(k, choices.size), replace=False, p=probs)
+        return choices[np.atleast_1d(idx)]
+    
+    def _sample_weighted_subset(self, choices: np.ndarray, weights: np.ndarray, k: int) -> np.ndarray:
+        if choices.size == 0 or k <= 0:
+            return np.empty((0,), dtype=choices.dtype)
+        probs = np.clip(np.asarray(weights, dtype=np.float64), 0.0, None)
+        total = float(probs.sum())
+        if total <= 0.0 or not np.isfinite(total):
+            probs = np.full(choices.size, 1.0 / float(choices.size), dtype=np.float64)
+        else:
+            probs /= total
+            adjust = 1.0 - float(probs.sum())
+            if abs(adjust) > 1e-15:
+                probs[-1] += adjust
+            probs = np.clip(probs, 0.0, 1.0)
+            norm = float(probs.sum())
+            if norm <= 0.0 or not np.isfinite(norm):
+                probs = np.full(choices.size, 1.0 / float(choices.size), dtype=np.float64)
+            else:
+                probs /= norm
+        idx = self.rng.choice(choices.size, size=min(k, choices.size), replace=False, p=probs)
+        return choices[np.atleast_1d(idx)]
+    
     def _select_branch_actions(self, infoset_key: Tuple[int, bytes], legal_actions: np.ndarray, sigma: np.ndarray, visit_count: int) -> np.ndarray:
         actions = legal_actions
         if actions.size == 0:
@@ -323,50 +376,43 @@ class CFRTrainer:
         effective_limit = self.branch_topk
         if effective_limit is None and self.max_branch_actions is not None:
             effective_limit = self.max_branch_actions
+        width_cap = actions.size
         if effective_limit is None or actions.size <= effective_limit:
             selected = actions
         else:
             probs_masked = sigma[actions]
-            width = min(actions.size, effective_limit)
+            width_cap = min(actions.size, effective_limit)
             if self.progressive_widening:
                 extra = int(np.power(max(visit_count - 1, 0), self.pw_alpha))
-                width = min(actions.size, effective_limit + extra)
+                width_cap = min(actions.size, effective_limit + extra)
             if self.max_branch_actions is not None:
-                width = min(width, self.max_branch_actions)
-            top_idx = np.argpartition(probs_masked, -width)[-width:]
+                width_cap = min(width_cap, self.max_branch_actions)
+            top_idx = np.argpartition(probs_masked, -width_cap)[-width_cap:]
             selected = actions[top_idx]
-            if self.progressive_widening and width < actions.size:
+            if self.progressive_widening and width_cap < actions.size:
                 tail_mask = np.ones(actions.size, dtype=bool)
                 tail_mask[top_idx] = False
                 tail_actions = actions[tail_mask]
                 if tail_actions.size > 0:
-                    tail_probs = np.clip(probs_masked[tail_mask], 0.0, None).astype(np.float64)
-                    total = float(tail_probs.sum())
-                    if total <= 0.0 or not np.isfinite(total):
-                        tail_probs = np.full(tail_actions.size, 1.0 / tail_actions.size, dtype=np.float64)
-                    else:
-                        tail_probs /= total
-                        adjust = 1.0 - float(tail_probs.sum())
-                        if abs(adjust) > 1e-15:
-                            tail_probs[-1] += adjust
-                        tail_probs = np.clip(tail_probs, 0.0, 1.0)
-                        s2 = float(tail_probs.sum())
-                        if s2 <= 0.0 or not np.isfinite(s2):
-                            tail_probs = np.full(tail_actions.size, 1.0 / tail_actions.size, dtype=np.float64)
-                        else:
-                            tail_probs /= s2
                     samples = min(tail_actions.size, max(self.pw_tail, 1) + int(np.log1p(visit_count)))
-                    if self.max_branch_actions is not None:
-                        samples = min(samples, max(self.max_branch_actions - selected.size, 0))
-                    if samples > 0:
-                        idx = self.rng.choice(tail_actions.size, size=samples, replace=False, p=tail_probs)
-                        sampled = tail_actions[np.atleast_1d(idx)]
+                    sampled = self._sample_weighted_subset(tail_actions, probs_masked[tail_mask], samples)
+                    if sampled.size > 0:
                         selected = np.concatenate([selected, sampled.astype(selected.dtype)])
+        selected = np.unique(selected.astype(np.int32))
+        if width_cap < selected.size:
+            downsampled = self._sample_weighted_subset(selected, sigma[selected], width_cap)
+            if downsampled.size > 0:
+                selected = downsampled.astype(np.int32)
+            else:
+                selected = selected[:width_cap]
+        
         if self.max_branch_actions is not None and selected.size > self.max_branch_actions:
-            probs_sel = sigma[selected]
-            keep_idx = np.argpartition(probs_sel, -self.max_branch_actions)[-self.max_branch_actions:]
-            selected = selected[keep_idx]
-        return np.sort(np.unique(selected))
+            downsampled = self._sample_weighted_subset(selected, sigma[selected], self.max_branch_actions)
+            if downsampled.size > 0:
+                selected = downsampled.astype(np.int32)
+            else:
+                selected = selected[:self.max_branch_actions]
+        return np.sort(selected.astype(np.int32))
 
     def _apply_action_inplace(self, st: NState, action_idx: int) -> ActionDiff:
         seat = int(st.cur_player)
@@ -454,7 +500,7 @@ class CFRTrainer:
                     break
                 if cur == target_seat:
                     infoset_key = (cur, self._obs_key(obs))
-                    sigma = self._get_strategy(infoset_key, legal_mask)
+                    sigma = self._peek_strategy(infoset_key, legal_mask)
                     action = int(self._safe_sample(sigma, legal_mask, rng))
                 else:
                     action = int(rng.choice(legal_actions))
