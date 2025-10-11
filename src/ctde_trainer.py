@@ -145,6 +145,7 @@ class CTDETrainer:
 
         self.rng_key = jax.random.PRNGKey(seed)
         self.np_rng = np.random.default_rng(seed)
+        self.eval_rng = np.random.default_rng(seed + 100003)
 
         env = self.env_fn()
         try:
@@ -178,24 +179,28 @@ class CTDETrainer:
         self.target_actor_params = tree_soft_update(self.target_actor_params, self.actor_params, tau)
         self.target_critic_params = tree_soft_update(self.target_critic_params, self.critic_params, tau)
 
-    def sample_action(self, obs: np.ndarray, mask: np.ndarray, epsilon: float) -> int:
+    def sample_action(self, obs: np.ndarray, mask: np.ndarray, epsilon: float,
+                      params: Sequence[Dict[str, Array]] = None,
+                      rng=None) -> int:
         obs_flat = jnp.asarray(obs.reshape(-1), dtype=jnp.float32)
         mask_arr = jnp.asarray(mask, dtype=jnp.float32)
-        logits = mlp_forward(self.actor_params, obs_flat)
+        net_params = self.actor_params if params is None else params
+        rng = self.np_rng if rng is None else rng
+        logits = mlp_forward(net_params, obs_flat)
         masked = mask_logits(logits, mask_arr)
         probs = jax.nn.softmax(masked)
         probs_np = np.asarray(probs, dtype=np.float32)
         legal = np.flatnonzero(np.asarray(mask, dtype=np.float32) > 0.0)
         if legal.size == 0:
             return 0
-        if epsilon > 0.0 and self.np_rng.random() < epsilon:
-            return int(self.np_rng.choice(legal))
+        if epsilon > 0.0 and rng.random() < epsilon:
+            return int(rng.choice(legal))
         safe_probs = probs_np[legal]
         total = safe_probs.sum()
         if total <= 0.0 or not np.isfinite(total):
-            return int(self.np_rng.choice(legal))
+            return int(rng.choice(legal))
         safe_probs = safe_probs / total
-        chosen = int(self.np_rng.choice(legal, p=safe_probs))
+        chosen = int(rng.choice(legal, p=safe_probs))
         return chosen
 
     def collect_episode(self, epsilon: float):
@@ -262,6 +267,82 @@ class CTDETrainer:
         }
         return transitions, info
 
+    def play_episode(self, epsilon: float, actor_params: Sequence[Dict[str, Array]], mode: str):
+        env = self.env_fn()
+        seed = int(self.eval_rng.integers(0, 2**31 - 1))
+        try:
+            env.reset(seed=seed)
+        except TypeError:
+            env.reset()
+        final_rewards = np.zeros(self.num_seats, dtype=np.float32)
+        steps = 0
+        while True:
+            agent = env.agent_selection
+            if agent is None:
+                break
+            if env.terminations[agent] or env.truncations[agent]:
+                if all(env.terminations.values()) or all(env.truncations.values()):
+                    for name, reward in env.rewards.items():
+                        seat = env.agent_name_mapping[name]
+                        final_rewards[seat] = reward
+                    break
+                env.step(None)
+                continue
+            seat = env.agent_name_mapping[agent]
+            obs = np.asarray(env.observations[agent], dtype=np.float32)
+            mask = np.asarray(env.infos[agent]["action_mask"], dtype=np.float32)
+            if mode == "vs_random" and seat % 2 == 1:
+                legal = np.flatnonzero(mask > 0.0)
+                if legal.size == 0:
+                    action = 0
+                else:
+                    action = int(self.eval_rng.choice(legal))
+            else:
+                action = self.sample_action(obs, mask, epsilon, params=actor_params, rng=self.eval_rng)
+            env.step(int(action))
+            steps += 1
+        if hasattr(env, "close"):
+            env.close()
+        team_reward = float(final_rewards[0]) if final_rewards.size > 0 else 0.0
+        return {
+            "team_reward": team_reward,
+            "final_rewards": final_rewards,
+            "steps": steps,
+        }
+
+    def evaluate(self, episodes: int = 10, epsilon: float = 0.0, use_target: bool = True, incl_vs_random: bool = False) -> Dict[str, float]:
+        params = self.target_actor_params if use_target else self.actor_params
+        modes = [("self", "self")]
+        if incl_vs_random:
+            modes.append(("vs_random", "vs_random"))
+        results: Dict[str, float] = {}
+        for mode_key, mode in modes:
+            returns: List[float] = []
+            wins = 0
+            ties = 0
+            total_steps = 0
+            count = max(int(episodes), 0)
+            for _ in range(count):
+                info = self.play_episode(epsilon, params, mode)
+                ret = float(info["team_reward"])
+                returns.append(ret)
+                total_steps += int(info["steps"])
+                if ret > 0.0:
+                    wins += 1
+                elif ret == 0.0:
+                    ties += 1
+            n = len(returns)
+            avg_return = float(np.mean(returns)) if n > 0 else 0.0
+            win_rate = float(wins) / float(n) if n > 0 else 0.0
+            tie_rate = float(ties) / float(n) if n > 0 else 0.0
+            avg_steps = float(total_steps) / float(n) if n > 0 else 0.0
+            prefix = mode_key
+            results[f"{prefix}/avg_return"] = avg_return
+            results[f"{prefix}/win_rate"] = win_rate
+            results[f"{prefix}/tie_rate"] = tie_rate
+            results[f"{prefix}/avg_steps"] = avg_steps
+        return results
+
     def _batchify(self, transitions: List[Transition]) -> Dict[str, Array]:
         obs = jnp.asarray(np.stack([t.obs.reshape(-1) for t in transitions], axis=0), dtype=jnp.float32)
         mask = jnp.asarray(np.stack([t.mask for t in transitions], axis=0), dtype=jnp.float32)
@@ -278,7 +359,11 @@ class CTDETrainer:
             "seat": seat,
         }
 
-    def train(self, epochs: int, episodes_per_epoch: int):
+    def train(self, epochs: int, episodes_per_epoch: int,
+              eval_every: int = 0,
+              eval_episodes: int = 16,
+              eval_use_target: bool = True,
+              eval_vs_random: bool = False):
         total_steps = 0
         for epoch in range(1, epochs + 1):
             batch_transitions: List[Transition] = []
@@ -299,9 +384,33 @@ class CTDETrainer:
                 self._soft_update_targets()
             self.epsilon = max(self.epsilon_end, self.epsilon * self.epsilon_decay)
             avg_return = float(np.mean(returns)) if returns else 0.0
+            eval_metrics = None
+            if eval_every > 0 and (epoch % eval_every == 0):
+                eval_metrics = self.evaluate(episodes=eval_episodes, epsilon=0.0, use_target=eval_use_target, incl_vs_random=eval_vs_random)
             if self.tlogger is not None:
                 self.tlogger.writer.add_scalar("CTDE/actor_loss", float(actor_l), epoch)
                 self.tlogger.writer.add_scalar("CTDE/critic_loss", float(critic_l), epoch)
                 self.tlogger.writer.add_scalar("CTDE/avg_return", avg_return, epoch)
                 self.tlogger.writer.add_scalar("CTDE/epsilon", float(self.epsilon), epoch)
+                if eval_metrics is not None:
+                    for key, value in eval_metrics.items():
+                        self.tlogger.writer.add_scalar(f"CTDEEval/{key}", float(value), epoch)
             print(f"Epoch {epoch:04d} | avg_return={avg_return:.3f} | actor_loss={float(actor_l):.4f} | critic_loss={float(critic_l):.4f} | eps={self.epsilon:.3f}")
+            if eval_metrics is not None:
+                grouped: Dict[str, Dict[str, float]] = {}
+                for key, value in eval_metrics.items():
+                    if "/" in key:
+                        mode, metric = key.split("/", 1)
+                    else:
+                        mode, metric = "self", key
+                    grouped.setdefault(mode, {})[metric] = float(value)
+                mode_summaries = []
+                for mode, metrics in grouped.items():
+                    mode_summaries.append("{mode}: avg_return={avg:.3f} win_rate={win:.3f} tie_rate={tie:.3f} avg_steps={steps:.2f}".format(
+                        mode=mode,
+                        avg=float(metrics.get("avg_return", 0.0)),
+                        win=float(metrics.get("win_rate", 0.0)),
+                        tie=float(metrics.get("tie_rate", 0.0)),
+                        steps=float(metrics.get("avg_steps", 0.0))
+                    ))
+                print("    Eval -> " + " || ".join(mode_summaries))

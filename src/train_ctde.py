@@ -18,9 +18,9 @@ def parse_hidden(value: str) -> Tuple[int, ...]:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--epochs", type=int, default=400, help="Training epochs (outer loops)")
+    parser.add_argument("--epochs", type=int, default=2500, help="Training epochs (outer loops)")
     parser.add_argument("--episodes_per_epoch", type=int, default=16, help="Episodes sampled per epoch")
-    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=123412412)
     parser.add_argument("--actor_lr", type=float, default=3e-4)
     parser.add_argument("--critic_lr", type=float, default=3e-4)
     parser.add_argument("--gamma", type=float, default=0.99)
@@ -31,6 +31,10 @@ def main():
     parser.add_argument("--critic_hidden", type=str, default="256,128", help="Comma-separated hidden sizes for critic MLP")
     parser.add_argument("--target_tau", type=float, default=0.01, help="Soft-update rate for target networks")
     parser.add_argument("--target_interval", type=int, default=1, help="Gradient steps between target-network updates")
+    parser.add_argument("--eval_every", type=int, default=50, help="Evaluate and log every N epochs (0 disables)")
+    parser.add_argument("--eval_episodes", type=int, default=32, help="Episodes per evaluation run")
+    parser.add_argument("--eval_policy", type=str, default="target", choices=["target", "online"], help="Actor parameters to use during evaluation")
+    parser.add_argument("--eval_vs_random", action="store_true", help="Also evaluate against random opponents")
     parser.add_argument("--log_dir", type=str, default="", help="Custom log directory (defaults to timestamped run)")
     args = parser.parse_args()
 
@@ -64,7 +68,11 @@ def main():
                           target_update_interval=args.target_interval,
                           tlogger=tlog)
     try:
-        trainer.train(args.epochs, args.episodes_per_epoch)
+        trainer.train(args.epochs, args.episodes_per_epoch,
+                      eval_every=args.eval_every,
+                      eval_episodes=args.eval_episodes,
+                      eval_use_target=(args.eval_policy == "target"),
+                      eval_vs_random=args.eval_vs_random)
     finally:
         tlog.close()
 
