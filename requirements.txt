@@ -5,3 +5,4 @@ tlogger
 ipython
 tensorboardX
 tqdm
+jax
