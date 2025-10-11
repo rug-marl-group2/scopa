@@ -29,6 +29,8 @@ def main():
     parser.add_argument("--epsilon_decay", type=float, default=0.995)
     parser.add_argument("--actor_hidden", type=str, default="256,128", help="Comma-separated hidden sizes for actor MLP")
     parser.add_argument("--critic_hidden", type=str, default="256,128", help="Comma-separated hidden sizes for critic MLP")
+    parser.add_argument("--target_tau", type=float, default=0.01, help="Soft-update rate for target networks")
+    parser.add_argument("--target_interval", type=int, default=1, help="Gradient steps between target-network updates")
     parser.add_argument("--log_dir", type=str, default="", help="Custom log directory (defaults to timestamped run)")
     args = parser.parse_args()
 
@@ -58,6 +60,8 @@ def main():
                           epsilon_start=args.epsilon_start,
                           epsilon_end=args.epsilon_end,
                           epsilon_decay=args.epsilon_decay,
+                          target_tau=args.target_tau,
+                          target_update_interval=args.target_interval,
                           tlogger=tlog)
     try:
         trainer.train(args.epochs, args.episodes_per_epoch)

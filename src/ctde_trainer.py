@@ -4,10 +4,19 @@ from typing import Callable, Dict, List, Sequence
 
 import jax
 import jax.numpy as jnp
+import jax.tree_util as jtu
 import numpy as np
 
 
 Array = jnp.ndarray
+
+
+def tree_copy(params):
+    return jtu.tree_map(lambda x: x.copy(), params)
+
+
+def tree_soft_update(target, source, tau):
+    return jtu.tree_map(lambda t, s: (1.0 - tau) * t + tau * s, target, source)
 
 
 def init_mlp(key: Array, sizes: Sequence[int]) -> List[Dict[str, Array]]:
@@ -58,7 +67,7 @@ def critic_forward(params: Sequence[Dict[str, Array]], global_state: Array, seat
 
 
 def actor_loss(params: Sequence[Dict[str, Array]],
-               critic_params: Sequence[Dict[str, Array]],
+               target_critic_params: Sequence[Dict[str, Array]],
                batch: Dict[str, Array],
                num_seats: int) -> Array:
     logits = mlp_forward(params, batch["obs"])
@@ -67,8 +76,8 @@ def actor_loss(params: Sequence[Dict[str, Array]],
     actions = batch["actions"]
     idx = jnp.arange(actions.shape[0])
     chosen_log_probs = log_probs[idx, actions]
-    values = critic_forward(critic_params, batch["global_state"], batch["seat"], num_seats)
-    advantages = jax.lax.stop_gradient(batch["returns"] - values)
+    baseline = critic_forward(target_critic_params, batch["global_state"], batch["seat"], num_seats)
+    advantages = jax.lax.stop_gradient(batch["returns"] - baseline)
     return -jnp.mean(chosen_log_probs * advantages)
 
 
@@ -82,12 +91,12 @@ def critic_loss(params: Sequence[Dict[str, Array]],
 
 
 def _actor_step(params: Sequence[Dict[str, Array]],
-                critic_params: Sequence[Dict[str, Array]],
+                target_critic_params: Sequence[Dict[str, Array]],
                 batch: Dict[str, Array],
                 lr: float,
                 num_seats: int):
-    loss, grads = jax.value_and_grad(actor_loss)(params, critic_params, batch, num_seats)
-    new_params = jax.tree_util.tree_map(lambda p, g: p - lr * g, params, grads)
+    loss, grads = jax.value_and_grad(actor_loss)(params, target_critic_params, batch, num_seats)
+    new_params = jtu.tree_map(lambda p, g: p - lr * g, params, grads)
     return new_params, loss
 
 
@@ -96,7 +105,7 @@ def _critic_step(params: Sequence[Dict[str, Array]],
                  lr: float,
                  num_seats: int):
     loss, grads = jax.value_and_grad(critic_loss)(params, batch, num_seats)
-    new_params = jax.tree_util.tree_map(lambda p, g: p - lr * g, params, grads)
+    new_params = jtu.tree_map(lambda p, g: p - lr * g, params, grads)
     return new_params, loss
 
 
@@ -118,6 +127,8 @@ class CTDETrainer:
                  epsilon_start: float = 0.2,
                  epsilon_end: float = 0.05,
                  epsilon_decay: float = 0.995,
+                 target_tau: float = 0.01,
+                 target_update_interval: int = 1,
                  tlogger: object = None):
         self.env_fn = env_fn
         self.gamma = gamma
@@ -127,6 +138,10 @@ class CTDETrainer:
         self.epsilon_end = epsilon_end
         self.epsilon_decay = epsilon_decay
         self.tlogger = tlogger
+
+        self.target_tau = float(target_tau)
+        self.target_update_interval = max(int(target_update_interval), 1)
+        self._update_counter = 0
 
         self.rng_key = jax.random.PRNGKey(seed)
         self.np_rng = np.random.default_rng(seed)
@@ -154,6 +169,14 @@ class CTDETrainer:
         self.rng_key, critic_key = jax.random.split(self.rng_key)
         critic_sizes = [self.global_state_dim + self.num_seats, *critic_hidden, 1]
         self.critic_params = init_mlp(critic_key, critic_sizes)
+
+        self.target_actor_params = tree_copy(self.actor_params)
+        self.target_critic_params = tree_copy(self.critic_params)
+
+    def _soft_update_targets(self):
+        tau = self.target_tau
+        self.target_actor_params = tree_soft_update(self.target_actor_params, self.actor_params, tau)
+        self.target_critic_params = tree_soft_update(self.target_critic_params, self.critic_params, tau)
 
     def sample_action(self, obs: np.ndarray, mask: np.ndarray, epsilon: float) -> int:
         obs_flat = jnp.asarray(obs.reshape(-1), dtype=jnp.float32)
@@ -269,8 +292,11 @@ class CTDETrainer:
             if not batch_transitions:
                 continue
             batch = self._batchify(batch_transitions)
-            self.actor_params, actor_l = actor_step(self.actor_params, self.critic_params, batch, self.actor_lr, self.num_seats)
+            self.actor_params, actor_l = actor_step(self.actor_params, self.target_critic_params, batch, self.actor_lr, self.num_seats)
             self.critic_params, critic_l = critic_step(self.critic_params, batch, self.critic_lr, self.num_seats)
+            self._update_counter += 1
+            if self._update_counter % self.target_update_interval == 0:
+                self._soft_update_targets()
             self.epsilon = max(self.epsilon_end, self.epsilon * self.epsilon_decay)
             avg_return = float(np.mean(returns)) if returns else 0.0
             if self.tlogger is not None:
