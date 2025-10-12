@@ -13,7 +13,8 @@ except Exception as e:  # pragma: no cover
 
 from tlogger import TLogger
 from env import env as make_env
-from cfr_jax import CFRTrainer, SavedPolicy
+from cfr_jax import CFRTrainer
+from ctde_trainer import CTDETrainer
 
 
 def card_id(card) -> str:
@@ -45,7 +46,7 @@ def serialize_cards(cards) -> List[Dict[str, Any]]:
 class GameManager:
     tlog: TLogger
     env: Any
-    actor: Optional[SavedPolicy]
+    actor: Optional[Any]
     mode: str  # 'selfplay' or 'vs_random'
     seed: int
     last_move: Optional[Dict[str, Any]] = None
@@ -68,7 +69,14 @@ class GameManager:
             return int(random.choice(legal))
         if self.actor is None:
             return int(random.choice(legal))
-        a = int(self.actor.act_from_obs(seat, obs))
+        actor = self.actor
+        if hasattr(actor, 'act_with_mask'):
+            try:
+                a = int(actor.act_with_mask(seat, obs, mask))
+            except TypeError:
+                a = int(actor.act_from_obs(seat, obs))
+        else:
+            a = int(actor.act_from_obs(seat, obs))
         if mask[a] == 0:
             return int(legal[0])
         return a
@@ -290,10 +298,19 @@ def create_app(checkpoint: Optional[str], mode: str, seed: int, log_dir: Optiona
     env = make_env(tlog)
     actor = None
     if checkpoint:
-        try:
-            actor = CFRTrainer.load_avg_policy(checkpoint, seed=seed)
-        except Exception as e:
-            print(f"WARNING: failed to load checkpoint '{checkpoint}': {e}")
+        load_errors = []
+        for label, loader in (
+            ("CFR average policy", lambda: CFRTrainer.load_avg_policy(checkpoint, seed=seed)),
+            ("CTDE actor", lambda: CTDETrainer.load_policy(checkpoint, seed=seed)),
+        ):
+            try:
+                actor = loader()
+                break
+            except Exception as exc:
+                load_errors.append(f"{label}: {exc}")
+        if actor is None and load_errors:
+            joined = "; ".join(load_errors)
+            print(f"WARNING: failed to load checkpoint '{checkpoint}': {joined}")
     gm = GameManager(tlog=tlog, env=env, actor=actor, mode=mode, seed=seed)
     gm.reset(mode=mode, seed=seed)
 

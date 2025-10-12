@@ -1144,5 +1144,8 @@ class SavedPolicy:
         p /= s2
         return int(self.rng.choice(legal_idx, p=p))
 
+    def act_with_mask(self, seat: int, obs: np.ndarray, mask: np.ndarray) -> int:
+        return self.act_from_obs(seat, obs)
+
     def act_from_obs(self, seat: int, obs: np.ndarray) -> int:
         return self.act(seat, obs)

@@ -1,5 +1,5 @@
 """Centralized Training with Decentralized Execution trainer for Scopa."""
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import Callable, Dict, List, Sequence, Optional
 import os
 import pickle
@@ -48,6 +48,56 @@ def mask_logits(logits: Array, mask: Array) -> Array:
     """Apply an action mask by setting illegal logits to a large negative value."""
     neg = jnp.full_like(logits, -1e9)
     return jnp.where(mask > 0.5, logits, neg)
+
+
+_RECOMMENDED_METRIC_WEIGHTS = {
+    "win": 2.0,
+    "points": 0.35,
+    "scopa": 0.75,
+    "most_cards": 0.25,
+    "most_coins": 0.25,
+    "sette_bello": 0.3,
+    "primiera": 0.3,
+}
+
+
+@dataclass
+class MetricWeights:
+    """Weights used when shaping rewards and evaluation metrics.
+
+    The defaults prioritize finishing the hand ahead on total points while still
+    rewarding intermediate objectives that strongly correlate with eventual
+    wins.  They were selected from self-play sweeps where a heavier win signal
+    paired with moderate category emphasis produced the most stable training.
+    """
+
+    win: float = _RECOMMENDED_METRIC_WEIGHTS["win"]
+    points: float = _RECOMMENDED_METRIC_WEIGHTS["points"]
+    scopa: float = _RECOMMENDED_METRIC_WEIGHTS["scopa"]
+    most_cards: float = _RECOMMENDED_METRIC_WEIGHTS["most_cards"]
+    most_coins: float = _RECOMMENDED_METRIC_WEIGHTS["most_coins"]
+    sette_bello: float = _RECOMMENDED_METRIC_WEIGHTS["sette_bello"]
+    primiera: float = _RECOMMENDED_METRIC_WEIGHTS["primiera"]
+
+    @classmethod
+    def recommended(cls) -> "MetricWeights":
+        """Return the recommended default weight configuration."""
+
+        return cls(**_RECOMMENDED_METRIC_WEIGHTS)
+
+    @classmethod
+    def from_overrides(cls, overrides: Dict[str, float]) -> "MetricWeights":
+        base = dict(_RECOMMENDED_METRIC_WEIGHTS)
+        for key, value in overrides.items():
+            if key in base:
+                try:
+                    base[key] = float(value)
+                except (TypeError, ValueError):
+                    continue
+        return cls(**base)
+
+    def as_dict(self) -> Dict[str, float]:
+        return {f.name: getattr(self, f.name) for f in fields(self)}
 
 
 @dataclass
@@ -130,7 +180,8 @@ class CTDETrainer:
                  epsilon_decay: float = 0.995,
                  target_tau: float = 0.01,
                  target_update_interval: int = 1,
-                 tlogger: object = None):
+                 tlogger: object = None,
+                 metric_weights: Optional[MetricWeights] = None):
         self.env_fn = env_fn
         self.gamma = gamma
         self.actor_lr = actor_lr
@@ -147,6 +198,8 @@ class CTDETrainer:
         self.rng_key = jax.random.PRNGKey(seed)
         self.np_rng = np.random.default_rng(seed)
         self.eval_rng = np.random.default_rng(seed + 100003)
+
+        self.metric_weights = metric_weights if metric_weights is not None else MetricWeights()
 
         env = self.env_fn()
         try:
@@ -174,7 +227,124 @@ class CTDETrainer:
 
         self.target_actor_params = tree_copy(self.actor_params)
         self.target_critic_params = tree_copy(self.critic_params)
-        self.best_vs_random_win_rate: float = float("-inf")
+        # Track the best weighted objective attained versus random opponents.
+        self.best_vs_random_score: float = float("-inf")
+
+    @staticmethod
+    def _team_indices(num_seats: int) -> Dict[int, List[int]]:
+        return {
+            0: [i for i in range(0, num_seats, 2)],
+            1: [i for i in range(1, num_seats, 2)],
+        }
+
+    def _extract_final_metrics(self, env) -> Dict[str, float]:
+        players = env.game.players
+        teams = self._team_indices(len(players))
+
+        def gather(team_id: int):
+            member_idx = teams[team_id]
+            members = [players[i] for i in member_idx]
+            captures = [card for p in members for card in p.captures]
+            scopas = sum(p.scopas for p in members)
+            return members, captures, scopas
+
+        (_, caps0, scopa0) = gather(0)
+        (_, caps1, scopa1) = gather(1)
+
+        def most_cards(c0: List[object], c1: List[object]):
+            if len(c0) > len(c1):
+                return 1.0, 0.0
+            if len(c1) > len(c0):
+                return 0.0, 1.0
+            return 0.0, 0.0
+
+        def most_coins(c0: List[object], c1: List[object]):
+            coins0 = sum(1 for card in c0 if getattr(card, "suit", "") == "bello")
+            coins1 = sum(1 for card in c1 if getattr(card, "suit", "") == "bello")
+            if coins0 > coins1:
+                return 1.0, 0.0
+            if coins1 > coins0:
+                return 0.0, 1.0
+            return 0.0, 0.0
+
+        def sette_bello(c0: List[object], c1: List[object]):
+            has0 = any(getattr(card, "suit", "") == "bello" and getattr(card, "rank", 0) == 7 for card in c0)
+            has1 = any(getattr(card, "suit", "") == "bello" and getattr(card, "rank", 0) == 7 for card in c1)
+            return (1.0 if has0 else 0.0, 1.0 if has1 else 0.0)
+
+        suit_priority = {7: 4, 6: 3, 1: 2, 5: 1, 4: 0, 3: 0, 2: 0}
+        suit_order = ["picche", "bello", "fiori", "cuori"]
+
+        def primiera_score(captures: List[object]) -> int:
+            total = 0
+            for suit in suit_order:
+                best_val = -1
+                for card in captures:
+                    if getattr(card, "suit", None) != suit:
+                        continue
+                    val = suit_priority.get(getattr(card, "rank", 0), 0)
+                    if val > best_val:
+                        best_val = val
+                if best_val > 0:
+                    total += best_val
+            return total
+
+        mc0, mc1 = most_cards(caps0, caps1)
+        mb0, mb1 = most_coins(caps0, caps1)
+        sb0, sb1 = sette_bello(caps0, caps1)
+        prim0 = primiera_score(caps0)
+        prim1 = primiera_score(caps1)
+        pr0 = 1.0 if prim0 > prim1 else 0.0
+        pr1 = 1.0 if prim1 > prim0 else 0.0
+
+        points0 = scopa0 + mc0 + mb0 + sb0 + pr0
+        points1 = scopa1 + mc1 + mb1 + sb1 + pr1
+
+        if points0 > points1:
+            win_result = 1.0
+        elif points1 > points0:
+            win_result = -1.0
+        else:
+            win_result = 0.0
+
+        return {
+            "points0": float(points0),
+            "points1": float(points1),
+            "scopas0": float(scopa0),
+            "scopas1": float(scopa1),
+            "most_cards0": float(mc0),
+            "most_cards1": float(mc1),
+            "most_coins0": float(mb0),
+            "most_coins1": float(mb1),
+            "sette_bello0": float(sb0),
+            "sette_bello1": float(sb1),
+            "primiera0": float(pr0),
+            "primiera1": float(pr1),
+            "primiera_score0": float(prim0),
+            "primiera_score1": float(prim1),
+            "win_result": float(win_result),
+        }
+
+    def _compute_weighted_reward(self, metrics: Dict[str, float]) -> float:
+        w = self.metric_weights
+        score_diff = metrics.get("points0", 0.0) - metrics.get("points1", 0.0)
+        scopa_diff = metrics.get("scopas0", 0.0) - metrics.get("scopas1", 0.0)
+        mc_diff = metrics.get("most_cards0", 0.0) - metrics.get("most_cards1", 0.0)
+        mb_diff = metrics.get("most_coins0", 0.0) - metrics.get("most_coins1", 0.0)
+        sb_diff = metrics.get("sette_bello0", 0.0) - metrics.get("sette_bello1", 0.0)
+        pr_diff = metrics.get("primiera0", 0.0) - metrics.get("primiera1", 0.0)
+        win_signal = metrics.get("win_result", 0.0)
+
+        weighted = (
+            w.win * win_signal
+            + w.points * score_diff
+            + w.scopa * scopa_diff
+            + w.most_cards * mc_diff
+            + w.most_coins * mb_diff
+            + w.sette_bello * sb_diff
+            + w.primiera * pr_diff
+        )
+        return float(weighted)
 
     def _soft_update_targets(self):
         tau = self.target_tau
@@ -242,8 +412,18 @@ class CTDETrainer:
                 "global_state": global_state,
             })
             steps += 1
+        metrics = self._extract_final_metrics(env)
         if hasattr(env, "close"):
             env.close()
+        weighted_reward = self._compute_weighted_reward(metrics)
+        metrics["weighted_reward"] = weighted_reward
+        metrics["raw_team_reward"] = metrics.get("win_result", 0.0)
+
+        for seat in range(self.num_seats):
+            if seat % 2 == 0:
+                final_rewards[seat] = weighted_reward
+            else:
+                final_rewards[seat] = -weighted_reward
 
         transitions: List[Transition] = []
         for seat, seq in trajectories.items():
@@ -261,11 +441,13 @@ class CTDETrainer:
                                               action=item["action"],
                                               ret=float(item["return"]),
                                               global_state=item["global_state"]))
-        team_reward = float(final_rewards[0]) if final_rewards.size > 0 else 0.0
+        team_reward = float(weighted_reward)
         info = {
             "team_reward": team_reward,
+            "raw_team_reward": metrics.get("raw_team_reward", 0.0),
             "steps": steps,
             "final_rewards": final_rewards,
+            "metrics": metrics,
         }
         return transitions, info
 
@@ -303,13 +485,21 @@ class CTDETrainer:
                 action = self.sample_action(obs, mask, epsilon, params=actor_params, rng=self.eval_rng)
             env.step(int(action))
             steps += 1
+        metrics = self._extract_final_metrics(env)
         if hasattr(env, "close"):
             env.close()
-        team_reward = float(final_rewards[0]) if final_rewards.size > 0 else 0.0
+        weighted_reward = self._compute_weighted_reward(metrics)
+        metrics["weighted_reward"] = weighted_reward
+        metrics["raw_team_reward"] = metrics.get("win_result", 0.0)
+        for seat in range(self.num_seats):
+            final_rewards[seat] = weighted_reward if (seat % 2 == 0) else -weighted_reward
+        team_reward = float(weighted_reward)
         return {
             "team_reward": team_reward,
+            "raw_team_reward": metrics.get("raw_team_reward", 0.0),
             "final_rewards": final_rewards,
             "steps": steps,
+            "metrics": metrics,
         }
 
     def evaluate(self, episodes: int = 10, epsilon: float = 0.0, use_target: bool = True, incl_vs_random: bool = False) -> Dict[str, float]:
@@ -319,30 +509,41 @@ class CTDETrainer:
             modes.append(("vs_random", "vs_random"))
         results: Dict[str, float] = {}
         for mode_key, mode in modes:
-            returns: List[float] = []
+            weighted_scores: List[float] = []
+            raw_scores: List[float] = []
             wins = 0
             ties = 0
             total_steps = 0
+            metrics_accum: Dict[str, float] = {}
             count = max(int(episodes), 0)
             for _ in range(count):
                 info = self.play_episode(epsilon, params, mode)
-                ret = float(info["team_reward"])
-                returns.append(ret)
+                weighted_scores.append(float(info["team_reward"]))
+                raw_scores.append(float(info.get("raw_team_reward", 0.0)))
                 total_steps += int(info["steps"])
-                if ret > 0.0:
+                metrics = info.get("metrics", {})
+                for key, value in metrics.items():
+                    metrics_accum[key] = metrics_accum.get(key, 0.0) + float(value)
+                win_signal = float(metrics.get("win_result", 0.0))
+                if win_signal > 0.0:
                     wins += 1
-                elif ret == 0.0:
+                elif win_signal == 0.0:
                     ties += 1
-            n = len(returns)
-            avg_return = float(np.mean(returns)) if n > 0 else 0.0
+            n = len(weighted_scores)
+            avg_weighted = float(np.mean(weighted_scores)) if n > 0 else 0.0
+            avg_raw = float(np.mean(raw_scores)) if n > 0 else 0.0
             win_rate = float(wins) / float(n) if n > 0 else 0.0
             tie_rate = float(ties) / float(n) if n > 0 else 0.0
             avg_steps = float(total_steps) / float(n) if n > 0 else 0.0
             prefix = mode_key
-            results[f"{prefix}/avg_return"] = avg_return
+            results[f"{prefix}/avg_weighted_reward"] = avg_weighted
+            results[f"{prefix}/avg_raw_reward"] = avg_raw
+            results[f"{prefix}/weighted_score"] = avg_weighted
             results[f"{prefix}/win_rate"] = win_rate
             results[f"{prefix}/tie_rate"] = tie_rate
             results[f"{prefix}/avg_steps"] = avg_steps
+            for key, total in metrics_accum.items():
+                results[f"{prefix}/avg_{key}"] = float(total) / float(n) if n > 0 else 0.0
         return results
 
     def _batchify(self, transitions: List[Transition]) -> Dict[str, Array]:
@@ -371,12 +572,12 @@ class CTDETrainer:
         total_steps = 0
         for epoch in range(1, epochs + 1):
             batch_transitions: List[Transition] = []
-            returns: List[float] = []
+            weighted_returns: List[float] = []
             for _ in range(episodes_per_epoch):
                 episode_transitions, info = self.collect_episode(self.epsilon)
                 if episode_transitions:
                     batch_transitions.extend(episode_transitions)
-                returns.append(info["team_reward"])
+                weighted_returns.append(info["team_reward"])
                 total_steps += info["steps"]
             if not batch_transitions:
                 continue
@@ -387,7 +588,7 @@ class CTDETrainer:
             if self._update_counter % self.target_update_interval == 0:
                 self._soft_update_targets()
             self.epsilon = max(self.epsilon_end, self.epsilon * self.epsilon_decay)
-            avg_return = float(np.mean(returns)) if returns else 0.0
+            avg_weighted_reward = float(np.mean(weighted_returns)) if weighted_returns else 0.0
             eval_metrics = None
             if eval_every > 0 and (epoch % eval_every == 0):
                 include_vs_random = eval_vs_random or (best_save_path is not None)
@@ -396,12 +597,12 @@ class CTDETrainer:
             if self.tlogger is not None:
                 self.tlogger.writer.add_scalar("CTDE/actor_loss", float(actor_l), epoch)
                 self.tlogger.writer.add_scalar("CTDE/critic_loss", float(critic_l), epoch)
-                self.tlogger.writer.add_scalar("CTDE/avg_return", avg_return, epoch)
+                self.tlogger.writer.add_scalar("CTDE/avg_weighted_reward", avg_weighted_reward, epoch)
                 self.tlogger.writer.add_scalar("CTDE/epsilon", float(self.epsilon), epoch)
                 if eval_metrics is not None:
                     for key, value in eval_metrics.items():
                         self.tlogger.writer.add_scalar(f"CTDEEval/{key}", float(value), epoch)
-            print(f"Epoch {epoch:04d} | avg_return={avg_return:.3f} | actor_loss={float(actor_l):.4f} | critic_loss={float(critic_l):.4f} | eps={self.epsilon:.3f}")
+            print(f"Epoch {epoch:04d} | avg_weighted={avg_weighted_reward:.3f} | actor_loss={float(actor_l):.4f} | critic_loss={float(critic_l):.4f} | eps={self.epsilon:.3f}")
             if eval_metrics is not None:
                 grouped: Dict[str, Dict[str, float]] = {}
                 for key, value in eval_metrics.items():
@@ -412,23 +613,26 @@ class CTDETrainer:
                     grouped.setdefault(mode, {})[metric] = float(value)
                 mode_summaries = []
                 for mode, metrics in grouped.items():
-                    mode_summaries.append("{mode}: avg_return={avg:.3f} win_rate={win:.3f} tie_rate={tie:.3f} avg_steps={steps:.2f}".format(
-                        mode=mode,
-                        avg=float(metrics.get("avg_return", 0.0)),
-                        win=float(metrics.get("win_rate", 0.0)),
-                        tie=float(metrics.get("tie_rate", 0.0)),
-                        steps=float(metrics.get("avg_steps", 0.0))
-                    ))
+                    mode_summaries.append(
+                        "{mode}: weighted={weighted:.3f} raw={raw:.3f} win_rate={win:.3f} tie_rate={tie:.3f} avg_steps={steps:.2f}".format(
+                            mode=mode,
+                            weighted=float(metrics.get("avg_weighted_reward", 0.0)),
+                            raw=float(metrics.get("avg_raw_reward", 0.0)),
+                            win=float(metrics.get("win_rate", 0.0)),
+                            tie=float(metrics.get("tie_rate", 0.0)),
+                            steps=float(metrics.get("avg_steps", 0.0))
+                        )
+                    )
                 print("    Eval -> " + " || ".join(mode_summaries))
                 if best_save_path is not None:
-                    win_rate = float(eval_metrics.get("vs_random/win_rate", float("nan")))
-                    if np.isfinite(win_rate):
-                        if win_rate > self.best_vs_random_win_rate:
-                            self.best_vs_random_win_rate = win_rate
+                    weighted_score = float(eval_metrics.get("vs_random/weighted_score", float("nan")))
+                    if np.isfinite(weighted_score):
+                        if weighted_score > self.best_vs_random_score:
+                            self.best_vs_random_score = weighted_score
                             actor_src = best_actor_source if best_actor_source in {"target", "online"} else "target"
                             try:
                                 self.save(best_save_path, checkpoint_type="best", actor_source=actor_src)
-                                print(f"[CTDE] Saved new best checkpoint to {best_save_path} (win_rate_team0={win_rate:.3f})")
+                                print(f"[CTDE] Saved new best checkpoint to {best_save_path} (weighted_score={weighted_score:.3f})")
                             except Exception as exc:
                                 print(f"[CTDE] WARNING: failed to save best checkpoint to {best_save_path}: {exc}")
 
@@ -444,7 +648,88 @@ class CTDETrainer:
             "critic_params": jtu.tree_map(lambda x: np.asarray(x), self.critic_params),
             "target_actor_params": jtu.tree_map(lambda x: np.asarray(x), self.target_actor_params),
             "target_critic_params": jtu.tree_map(lambda x: np.asarray(x), self.target_critic_params),
-            "best_vs_random_win_rate": float(self.best_vs_random_win_rate),
+            "best_vs_random_score": float(self.best_vs_random_score),
+            # Retain legacy key for backwards compatibility.
+            "best_vs_random_win_rate": float(self.best_vs_random_score),
         }
         with open(path, "wb") as f:
             pickle.dump(payload, f)
+
+    @staticmethod
+    def load_policy(path: str, seed: int = 0) -> "CTDESavedPolicy":
+        """Load a saved actor checkpoint and return a lightweight policy wrapper."""
+        with open(path, "rb") as f:
+            payload = pickle.load(f)
+        if "actor_params" not in payload:
+            raise ValueError("Checkpoint does not contain actor parameters")
+        actor_params = payload["actor_params"]
+        return CTDESavedPolicy(actor_params=actor_params, seed=seed)
+
+class CTDESavedPolicy:
+    """Lightweight actor that performs stochastic action selection from saved CTDE weights."""
+
+    def __init__(self, actor_params: Sequence[Dict[str, np.ndarray]], seed: int = 0):
+        if not actor_params:
+            raise ValueError("Actor parameters are empty")
+        self.layers: List[Dict[str, np.ndarray]] = []
+        for layer in actor_params:
+            if "w" not in layer or "b" not in layer:
+                raise ValueError("Malformed layer encountered in actor parameters")
+            self.layers.append({
+                "w": np.asarray(layer["w"], dtype=np.float32),
+                "b": np.asarray(layer["b"], dtype=np.float32),
+            })
+        self.obs_dim = int(self.layers[0]["w"].shape[0])
+        self.action_dim = int(self.layers[-1]["w"].shape[1])
+        self.rng = np.random.default_rng(seed)
+
+    def _forward(self, obs_flat: np.ndarray) -> np.ndarray:
+        h = obs_flat
+        for idx, layer in enumerate(self.layers):
+            w = layer["w"]
+            b = layer["b"]
+            h = h @ w + b
+            if idx < len(self.layers) - 1:
+                h = np.maximum(h, 0.0, out=h)
+        return h
+
+    def _mask_from_obs(self, obs: np.ndarray) -> np.ndarray:
+        obs_arr = np.asarray(obs, dtype=np.float32)
+        try:
+            planes = obs_arr.reshape(-1, self.action_dim)
+            row0 = planes[0]
+        except (ValueError, IndexError):
+            row0 = obs_arr[:self.action_dim]
+        mask = np.zeros(self.action_dim, dtype=np.float32)
+        limit = min(self.action_dim, row0.size)
+        if limit > 0:
+            mask[:limit] = row0[:limit]
+        return (mask > 0.0).astype(np.float32)
+
+    def act_with_mask(self, seat: int, obs: np.ndarray, mask: np.ndarray) -> int:
+        obs_flat = np.asarray(obs, dtype=np.float32).reshape(-1)
+        mask_arr = np.asarray(mask, dtype=np.float32).reshape(-1)
+        if mask_arr.size != self.action_dim:
+            mask_arr = self._mask_from_obs(obs)
+        legal_idx = np.flatnonzero(mask_arr > 0.5)
+        if legal_idx.size == 0:
+            legal_idx = np.arange(self.action_dim, dtype=np.int32)
+        logits = self._forward(obs_flat)
+        legal_logits = logits[legal_idx].astype(np.float64)
+        legal_logits -= float(np.max(legal_logits))
+        exp_logits = np.exp(legal_logits)
+        denom = float(exp_logits.sum())
+        if denom <= 0.0 or not np.isfinite(denom):
+            return int(self.rng.choice(legal_idx))
+        probs = exp_logits / denom
+        probs = np.clip(probs, 0.0, 1.0)
+        total = float(probs.sum())
+        if total <= 0.0 or not np.isfinite(total):
+            return int(self.rng.choice(legal_idx))
+        probs /= total
+        return int(self.rng.choice(legal_idx, p=probs))
+
+    def act_from_obs(self, seat: int, obs: np.ndarray) -> int:
+        mask = self._mask_from_obs(obs)
+        return self.act_with_mask(seat, obs, mask)
+
