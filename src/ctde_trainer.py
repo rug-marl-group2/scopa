@@ -1,7 +1,8 @@
 """Centralized Training with Decentralized Execution trainer for Scopa."""
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Sequence
-
+from typing import Callable, Dict, List, Sequence, Optional
+import os
+import pickle
 import jax
 import jax.numpy as jnp
 import jax.tree_util as jtu
@@ -173,6 +174,7 @@ class CTDETrainer:
 
         self.target_actor_params = tree_copy(self.actor_params)
         self.target_critic_params = tree_copy(self.critic_params)
+        self.best_vs_random_win_rate: float = float("-inf")
 
     def _soft_update_targets(self):
         tau = self.target_tau
@@ -363,7 +365,9 @@ class CTDETrainer:
               eval_every: int = 0,
               eval_episodes: int = 16,
               eval_use_target: bool = True,
-              eval_vs_random: bool = False):
+              eval_vs_random: bool = False,
+              best_save_path: Optional[str] = None,
+              best_actor_source: str = "target"):
         total_steps = 0
         for epoch in range(1, epochs + 1):
             batch_transitions: List[Transition] = []
@@ -386,7 +390,9 @@ class CTDETrainer:
             avg_return = float(np.mean(returns)) if returns else 0.0
             eval_metrics = None
             if eval_every > 0 and (epoch % eval_every == 0):
-                eval_metrics = self.evaluate(episodes=eval_episodes, epsilon=0.0, use_target=eval_use_target, incl_vs_random=eval_vs_random)
+                include_vs_random = eval_vs_random or (best_save_path is not None)
+                eval_metrics = self.evaluate(episodes=eval_episodes, epsilon=0.0,
+                                             use_target=eval_use_target, incl_vs_random=include_vs_random)
             if self.tlogger is not None:
                 self.tlogger.writer.add_scalar("CTDE/actor_loss", float(actor_l), epoch)
                 self.tlogger.writer.add_scalar("CTDE/critic_loss", float(critic_l), epoch)
@@ -414,3 +420,31 @@ class CTDETrainer:
                         steps=float(metrics.get("avg_steps", 0.0))
                     ))
                 print("    Eval -> " + " || ".join(mode_summaries))
+                if best_save_path is not None:
+                    win_rate = float(eval_metrics.get("vs_random/win_rate", float("nan")))
+                    if np.isfinite(win_rate):
+                        if win_rate > self.best_vs_random_win_rate:
+                            self.best_vs_random_win_rate = win_rate
+                            actor_src = best_actor_source if best_actor_source in {"target", "online"} else "target"
+                            try:
+                                self.save(best_save_path, checkpoint_type="best", actor_source=actor_src)
+                                print(f"[CTDE] Saved new best checkpoint to {best_save_path} (win_rate_team0={win_rate:.3f})")
+                            except Exception as exc:
+                                print(f"[CTDE] WARNING: failed to save best checkpoint to {best_save_path}: {exc}")
+
+    def save(self, path: str, checkpoint_type: str = "final", actor_source: str = "online") -> None:
+        """Persist trainer parameters to disk."""
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        actor_source = actor_source if actor_source in {"online", "target"} else "online"
+        actor_params = self.target_actor_params if actor_source == "target" else self.actor_params
+        payload = {
+            "checkpoint_type": checkpoint_type,
+            "actor_source": actor_source,
+            "actor_params": jtu.tree_map(lambda x: np.asarray(x), actor_params),
+            "critic_params": jtu.tree_map(lambda x: np.asarray(x), self.critic_params),
+            "target_actor_params": jtu.tree_map(lambda x: np.asarray(x), self.target_actor_params),
+            "target_critic_params": jtu.tree_map(lambda x: np.asarray(x), self.target_critic_params),
+            "best_vs_random_win_rate": float(self.best_vs_random_win_rate),
+        }
+        with open(path, "wb") as f:
+            pickle.dump(payload, f)

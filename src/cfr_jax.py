@@ -138,11 +138,17 @@ def np_is_terminal(st: NState) -> bool:
 
 
 def np_evaluate_round(st: NState) -> tuple[int, int]:
+    captures = st.captures.copy()
+    table = st.table.copy()
+    if int(st.last_capture_player) >= 0:
+        seat = int(st.last_capture_player)
+        captures[seat] = np.clip(captures[seat] + table, 0, 1)
+        table[:] = 0
     # Team captures
     team0_mask = np.array([1, 0, 1, 0], dtype=np.int32)
     team1_mask = np.array([0, 1, 0, 1], dtype=np.int32)
-    team0_caps = (st.captures.T @ team0_mask).astype(np.int32)
-    team1_caps = (st.captures.T @ team1_mask).astype(np.int32)
+    team0_caps = (captures.T @ team0_mask).astype(np.int32)
+    team1_caps = (captures.T @ team1_mask).astype(np.int32)
 
     t0 = 0
     t1 = 0
@@ -267,6 +273,7 @@ class CFRTrainer:
         # infoset -> arrays of size 40 (global card index space)
         self.cum_regret: Dict[Tuple[int, bytes], np.ndarray] = {}
         self.cum_strategy: Dict[Tuple[int, bytes], np.ndarray] = {}
+        self.best_vs_random_win_rate: float = float("-inf")
 
     def _get_strategy(self, infoset_key, legal_mask: np.ndarray) -> np.ndarray:
         """Fetch/init tables for the given infoset and compute policy."""
@@ -487,6 +494,7 @@ class CFRTrainer:
 
     def _estimate_rollout_value(self, st: NState, target_seat: int, rng: Generator) -> float:
         samples = max(self.rollout_samples, 1) if self.rollout_samples else 1
+        policy_cache: Dict[Tuple[int, bytes], np.ndarray] = {}
         total = 0.0
         for _ in range(samples):
             trace: list[ActionDiff] = []
@@ -498,12 +506,12 @@ class CFRTrainer:
                 legal_actions = np.nonzero(legal_mask)[0]
                 if legal_actions.size == 0:
                     break
-                if cur == target_seat:
-                    infoset_key = (cur, self._obs_key(obs))
-                    sigma = self._peek_strategy(infoset_key, legal_mask)
-                    action = int(self._safe_sample(sigma, legal_mask, rng))
-                else:
-                    action = int(rng.choice(legal_actions))
+                infoset_key = (cur, self._obs_key(obs))
+                sigma = policy_cache.get(infoset_key)
+                if sigma is None:
+                    sigma = self._peek_strategy(infoset_key, legal_mask).copy()
+                    policy_cache[infoset_key] = sigma
+                action = int(self._safe_sample(sigma, legal_mask, rng))
                 diff = self._apply_action_inplace(st, action)
                 trace.append(diff)
                 steps += 1
@@ -896,7 +904,8 @@ class CFRTrainer:
     
     def train(self, iterations: int = 1000, seed: int = 42, verbose: bool = False, log_every: int = 100,
             eval_every: Optional[int] = None, eval_episodes: int = 32, eval_use_avg_policy: bool = True,
-            batch_size: Optional[int] = None):
+            batch_size: Optional[int] = None, traversals_per_deal: Optional[int] = 1,
+            best_save_path: Optional[str] = None, best_save_kind: Optional[str] = None):
         """Run MCCFR for a given number of iterations with mini-batching.
 
         Each iteration samples B independent deals and accumulates regrets/strategy.
@@ -907,21 +916,38 @@ class CFRTrainer:
                 B = 1
 
             util0_acc = 0.0
+            seat0_visits = 0
+
             for b in range(B):
                 rng = Generator(PCG64(seed + it * 100003 + b))
                 st = np_init_state(rng)
-                for target in range(4):
+                trav_per_deal = 1 if traversals_per_deal is None else int(traversals_per_deal)
+                if trav_per_deal <= 0:
+                    targets = range(4)
+                else:
+                    targets = [int(self.rng.integers(0, 4)) for _ in range(trav_per_deal)]
+                for target in targets:
                     util = self._mccfr(st, target)
                     if target == 0:
                         util0_acc += util
-                    if verbose and it % max(log_every, 1) == 0 and target == 0 and b == B - 1:
-                        print(f"Iter {it}: util seat0 (avg over {B}) ~ {util0_acc / float(B):.3f}")
+                    seat0_visits += 1
+
+            util0_avg = util0_acc / float(seat0_visits) if seat0_visits > 0 else None
+            if verbose and it % max(log_every, 1) == 0:
+                if seat0_visits > 0:
+                    print(f"Iter {it}: util seat0 (avg over {seat0_visits}) ~ {util0_avg:.3f}")
+                else:
+                    print(f"Iter {it}: util seat0 not sampled this iteration")
 
             if self.tlogger is not None and it % max(log_every, 1) == 0:
                 self._log_metrics(it, util0=util0_acc / float(B))
+                self._log_metrics(it, util0=util0_avg)
+                if seat0_visits > 0:
+                    self.tlogger.writer.add_scalar("CFR/seat0_traversals", float(seat0_visits), it)
+
 
             do_eval = (eval_every is not None and eval_every > 0 and (it % eval_every == 0))
-            if do_eval and self.tlogger is not None:
+            if do_eval and (self.tlogger is not None or best_save_path is not None):
                 selfplay_metrics = self.evaluate(episodes=eval_episodes, seed=seed + 7777 + it,
                                                 selfplay=True, use_avg_policy=eval_use_avg_policy)
                 for k, v in selfplay_metrics.items():
@@ -929,9 +955,20 @@ class CFRTrainer:
 
                 vsrnd_metrics = self.evaluate(episodes=eval_episodes, seed=seed + 8888 + it,
                                             selfplay=False, use_avg_policy=eval_use_avg_policy)
-                for k, v in vsrnd_metrics.items():
-                    self.tlogger.writer.add_scalar(f"EvalVsRandom/{k}", float(v), it)
+                if self.tlogger is not None:
+                    for k, v in vsrnd_metrics.items():
+                        self.tlogger.writer.add_scalar(f"EvalVsRandom/{k}", float(v), it)
 
+                if best_save_path is not None and vsrnd_metrics:
+                    win0 = float(vsrnd_metrics.get("win_rate_team0", 0.0))
+                    if win0 > self.best_vs_random_win_rate:
+                        self.best_vs_random_win_rate = win0
+                        kind = best_save_kind if best_save_kind else "avg"
+                        try:
+                            self.save(best_save_path, kind=kind)
+                            print(f"[CFR] Saved new best checkpoint to {best_save_path} (win_rate_team0={win0:.3f})")
+                        except Exception as exc:
+                            print(f"[CFR] WARNING: failed to save best checkpoint to {best_save_path}: {exc}")
 
     def get_average_policy(self) -> Dict[Tuple[int, bytes], np.ndarray]:
         policy = {}

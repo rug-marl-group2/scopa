@@ -89,6 +89,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--iters", type=int, default=1000)
     parser.add_argument("--batch_size", type=int, default=4, help="Deals per iteration for MCCFR mini-batch")
+    parser.add_argument("--traversals_per_deal", type=int, default=1, help="Number of target seats sampled per deal (<=0 traverses all seats)")
     parser.add_argument("--rm_plus", action="store_true", default=True, help="Use RM+ (regret clamping)")
     parser.add_argument("--seed", type=int, default=time.time_ns())
     parser.add_argument("--verbose", action="store_true")
@@ -113,6 +114,7 @@ def main():
     parser.add_argument("--table_dtype", type=str, default="float16", choices=["float16", "float32"], help="Data type for regret/strategy tables to reduce memory")
     parser.add_argument("--save_path", type=str, default="", help="Path to save trained model/policy (.pkl)")
     parser.add_argument("--save_kind", type=str, default="avg", choices=["avg", "full"], help="Save average policy or full trainer state")
+    parser.add_argument("--best_save_path", type=str, default="", help="Path to save best checkpoint (defaults inside run dir)")
     args = parser.parse_args()
 
     # Create logger first so CFR can log metrics
@@ -138,6 +140,8 @@ def main():
                          rollout_depth=args.rollout_depth,
                          rollout_samples=args.rollout_samples
                          )
+    best_save_path = args.best_save_path if args.best_save_path else os.path.join(tlog.get_log_dir(), f"policy_{args.save_kind}_best.pkl")
+
     trainer.train(
         iterations=args.iters,
         seed=args.seed,
@@ -146,11 +150,24 @@ def main():
         eval_every=args.eval_every if args.eval_every > 0 else None,
         eval_episodes=args.eval_eps,
         eval_use_avg_policy=(args.eval_policy == "avg"),
-        batch_size=args.batch_size
+        batch_size=args.batch_size,
+        best_save_path=best_save_path,
+        best_save_kind=args.save_kind,
+        traversals_per_deal=args.traversals_per_deal
     )
 
     # Save trained model/policy (default inside run dir)
     save_path = args.save_path if args.save_path else os.path.join(tlog.get_log_dir(), f"policy_{args.save_kind}.pkl")
+    final_eval = trainer.evaluate(episodes=args.eval_eps, seed=args.seed + 1234567, selfplay=False,
+                                  use_avg_policy=(args.eval_policy == "avg"))
+    final_win0 = float(final_eval.get("win_rate_team0", 0.0))
+    if best_save_path and final_win0 > trainer.best_vs_random_win_rate:
+        trainer.best_vs_random_win_rate = final_win0
+        try:
+            trainer.save(best_save_path, kind=args.save_kind)
+            print(f"Saved final policy as new best checkpoint to: {best_save_path} (win_rate_team0={final_win0:.3f})")
+        except Exception as e:
+            print(f"WARNING: failed to save best checkpoint to {best_save_path}: {e}")
     try:
         trainer.save(save_path, kind=args.save_kind)
         print(f"Saved {args.save_kind} checkpoint to: {save_path}")
