@@ -1,48 +1,64 @@
 #!/bin/bash
-#SBATCH --mem=32GB
-#SBATCH --time=20:55:55
-#SBATCH --job-name=mccfr1_1k
-#SBATCH --partition=gpu
-#SBATCH --nodes=1
-#SBATCH --output=scopa/logs/output.%j.log
-#SBATCH --error=scopa/logs/error.%j.log
+#SBATCH --job-name=training_pipeline
+#SBATCH --time=24:00:00
+#SBATCH --mem=24GB
+#SBATCH --gres=gpu:1                  # any GPU
+#SBATCH --output=logs/%x_%j.out
+#SBATCH --error=logs/%x_%j.err
 
 set -euo pipefail
 
-# Load environment/modules
 module --force purge
-module load CUDA/12.4.0
 
-# (Keep your custom shell init if you need it)
-source /home1/s6050786 || true
-
-# Ensure we’re in the submission directory (repo root)
-cd "${SLURM_SUBMIT_DIR:-$PWD}"
-
-# Ensure logs dir exists
-mkdir -p scopa/logs
-
-# Create venv if missing, then install requirements
-if [ ! -d ".venv" ]; then
-  echo "[INFO] .venv not found. Creating virtual environment..."
-  python3 -m venv .venv
-  # shellcheck source=/dev/null
-  source .venv/bin/activate
-  python -m pip install --upgrade pip
-  if [ -f "requirements.txt" ]; then
-    python -m pip install -r requirements.txt
-  else
-    echo "[WARN] requirements.txt not found at repo root; skipping pip install."
+# --- Pick an available Python module automatically (edit list if needed) ---
+for PYMOD in \
+  Python/3.11.5-GCCcore-13.2.0 \
+  Python/3.10.12-GCCcore-12.3.0 \
+  Python/3.9.18-GCCcore-12.2.0
+do
+  if module -t avail "$PYMOD" >/dev/null 2>&1; then
+    module load "$PYMOD"
+    echo "[INFO] Loaded $PYMOD"
+    break
   fi
-else
-  echo "[INFO] Using existing .venv"
-  # shellcheck source=/dev/null
-  source .venv/bin/activate
+done
+
+# If none of the above loaded, fall back to system python (warn)
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "[ERROR] No usable python found via modules or system PATH." >&2
+  exit 1
 fi
 
-# (Optional) show which python/pip we’ll use
+# --- Paths (edit these two to your project) ---
+PROJECT_DIR="$HOME/HandwrittenDocAnalysis"
+VENV_DIR="$HOME/envs/myenv"          # reuse your old env path
+
+mkdir -p "$(dirname "${SLURM_STDOUT:-logs/dummy.out}")" logs
+cd "$PROJECT_DIR"
+
+# --- Create venv if missing & install requirements ---
+if [ ! -d "$VENV_DIR" ]; then
+  echo "[INFO] Creating venv at $VENV_DIR"
+  python3 -m venv "$VENV_DIR"
+  source "$VENV_DIR/bin/activate"
+  python -m pip install --upgrade pip
+  if [ -f requirements.txt ]; then
+    python -m pip install -r requirements.txt
+  else
+    echo "[WARN] requirements.txt not found; skipping installs."
+  fi
+else
+  echo "[INFO] Using existing venv at $VENV_DIR"
+  source "$VENV_DIR/bin/activate"
+fi
+
+# Optional: print versions
 which python
 python --version
+pip --version
+
+# --- CUDA/PyTorch memory tweak (keep yours) ---
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # Run the training script
 srun python scopa/src/train_cfr.py \
