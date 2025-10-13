@@ -87,6 +87,7 @@ class ScopaGame:
         self.deck = Deck()
         self.deck.shuffle(seed=seed)
         self.table = []
+        self.last_capture = None
         for player in self.players:
             player.reset()
         for player in self.players:
@@ -117,6 +118,7 @@ class ScopaGame:
 
     def play_card(self, card, player):
         player.history.append(card)
+        player_index = self.players.index(player)
 
         # Ace mechanics: captures entire table without subset search
         if card.rank == 1:
@@ -124,6 +126,7 @@ class ScopaGame:
             self.table.append(card)
             player.capture(self.table, _with=card)
             self.table = []
+            self.last_capture = player_index
             return
 
         # Non-ace: check for a capturing combination
@@ -133,6 +136,7 @@ class ScopaGame:
                 self.table.remove(c)
             comb.append(card)
             player.capture(comb, _with=card)
+            self.last_capture = player_index
             if len(self.table) == 0:
                 player.scopas += 1
                 if self.tlogger is not None:
@@ -143,6 +147,12 @@ class ScopaGame:
             self.table.append(card)
 
     def evaluate_round(self):
+        if self.table and self.last_capture is not None:
+            capturing_player = self.players[self.last_capture]
+            capturing_player.capture(self.table)
+            self.table = []
+            self.last_capture = None
+            
         # Shared captures by team
         team1_captures = [card for player in self.players if player.side == 1 for card in player.captures]
         team2_captures = [card for player in self.players if player.side == 2 for card in player.captures]
@@ -473,6 +483,12 @@ class MaScopaEnv(AECEnv):
 
         self.game.play_card(card, player)
 
+        for name in self.agents:
+            self.observations[name] = self.observe(name)
+            if name not in self.infos:
+                self.infos[name] = {}
+            self.infos[name]["action_mask"] = self.get_action_mask(name)
+
         if PRINT_DEBUG: 
             print(f"### Table state after play: {[card.__str__() for card in self.game.table]}")
 
@@ -492,8 +508,6 @@ class MaScopaEnv(AECEnv):
             self.terminations = {agent: True for agent in self.agents}  # End the game
 
         if PRINT_DEBUG: print(f"### Observations updated for agent {agent}")
-        self.observations[agent] = self.observe(agent)
-        self.infos[agent]["action_mask"] = self.get_action_mask(agent)
         self.num_moves += 1
 
         if self.num_moves >= NUM_ITERS:

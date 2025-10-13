@@ -1,7 +1,7 @@
 import argparse
 import time
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Dict, Any, List
 
 import numpy as np
@@ -15,6 +15,23 @@ from tlogger import TLogger
 from env import env as make_env
 from cfr_jax import CFRTrainer
 from ctde_trainer import CTDETrainer
+
+
+def load_any_policy(checkpoint: str, seed: int):
+    """Attempt to load a policy checkpoint with CFR fallback before CTDE."""
+    load_attempts = [
+        ("CFR average policy", lambda: CFRTrainer.load_avg_policy(checkpoint, seed=seed)),
+        ("CTDE actor", lambda: CTDETrainer.load_policy(checkpoint, seed=seed)),
+    ]
+    errors = []
+    for label, loader in load_attempts:
+        try:
+            actor = loader()
+            print(f"Loaded {label} from {checkpoint}")
+            return actor
+        except Exception as exc:
+            errors.append(f"{label}: {exc}")
+    raise RuntimeError("; ".join(errors))
 
 
 def card_id(card) -> str:
@@ -46,9 +63,10 @@ def serialize_cards(cards) -> List[Dict[str, Any]]:
 class GameManager:
     tlog: TLogger
     env: Any
-    actor: Optional[Any]
     mode: str  # 'selfplay' or 'vs_random'
     seed: int
+    actors: Dict[int, Optional[Any]] = field(default_factory=lambda: {0: None, 1: None})
+    checkpoints: Dict[int, Optional[str]] = field(default_factory=lambda: {0: None, 1: None})
     last_move: Optional[Dict[str, Any]] = None
 
     def reset(self, mode: Optional[str] = None, seed: Optional[int] = None) -> None:
@@ -63,13 +81,25 @@ class GameManager:
         self.env.reset(seed=self.seed)
         self.last_move = None
 
+    def load_checkpoint(self, team: int, checkpoint: Optional[str]) -> None:
+        if team not in self.actors:
+            raise ValueError("team must be 0 or 1")
+        if checkpoint:
+            actor = load_any_policy(checkpoint, seed=int(self.seed) + int(team) * 7)
+            self.actors[team] = actor
+            self.checkpoints[team] = checkpoint
+        else:
+            self.actors[team] = None
+            self.checkpoints[team] = None
+
     def _select_action(self, seat: int, obs: np.ndarray, mask: np.ndarray) -> int:
         legal = [i for i, m in enumerate(mask) if m == 1]
-        if self.mode == 'vs_random' and (seat % 2 == 1):
+        team = seat % 2
+        actor = self.actors.get(team)
+        if self.mode == 'vs_random' and team == 1 and actor is None:
             return int(random.choice(legal))
-        if self.actor is None:
+        if actor is None:
             return int(random.choice(legal))
-        actor = self.actor
         if hasattr(actor, 'act_with_mask'):
             try:
                 a = int(actor.act_with_mask(seat, obs, mask))
@@ -135,6 +165,10 @@ class GameManager:
             ],
             'last_move': self.last_move,
             'scores': self.env.roundScores() if done else None,
+            'checkpoints': {
+                0: self.checkpoints.get(0),
+                1: self.checkpoints.get(1),
+            },
         }
 
 
@@ -149,7 +183,8 @@ HTML_PAGE = """
     .toolbar { display: flex; gap: 8px; align-items: center; padding: 10px; background: #fff; border-bottom: 1px solid #ccc; }
     .status { margin-left: auto; color: #2c3e50; }
     .board { display: grid; grid-template-rows: 1fr auto 1fr; grid-template-columns: 1fr 1fr 1fr; height: calc(100vh - 54px); }
-    .zone { padding: 8px; }
+    .zone { padding: 8px; border: 2px solid transparent; border-radius: 8px; transition: border-color 0.2s ease, background-color 0.2s ease; }
+    .zone.active-player { border-color: #2980b9; background: rgba(41, 128, 185, 0.12); }
     .cards-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
     .col { display: flex; flex-direction: column; gap: 8px; align-items: center; }
     .card { width: 64px; height: 92px; border: 2px solid #2c3e50; border-radius: 6px; background: #fff; display: flex; align-items: center; justify-content: center; text-align: center; font-weight: bold; }
@@ -160,6 +195,9 @@ HTML_PAGE = """
     .s-fiori { background: #27ae60; }
     .s-bello { background: #f1c40f; }
     .title { font-size: 14px; margin-bottom: 6px; color: #2c3e50; }
+    .checkpoint-status { font-size: 12px; color: #34495e; }
+    .checkpoint-group { display: flex; align-items: center; gap: 6px; }
+    .toolbar input[type="text"] { padding: 2px 4px; }
   </style>
   <script>
     let autoTimer = null;
@@ -184,6 +222,32 @@ HTML_PAGE = """
     function render(state) {
       const root = document.getElementById('root');
       const highlightIds = state.last_move ? state.last_move.captured : [];
+      let activeSeat = Array.isArray(state.players) ? state.players.findIndex(p => p.name === state.agent) : -1;
+      if (activeSeat < 0 && typeof state.agent === 'string') {
+        const match = state.agent.match(/player_(\\d+)/);
+        if (match) {
+          activeSeat = parseInt(match[1], 10);
+        }
+      }
+      const checkpoints = state.checkpoints || {};
+      const ckpt0 = checkpoints[0] ?? checkpoints['0'] ?? '';
+      const ckpt1 = checkpoints[1] ?? checkpoints['1'] ?? '';
+      const ckpt0Input = document.getElementById('ckpt-0');
+      if (ckpt0Input && document.activeElement !== ckpt0Input) {
+        ckpt0Input.value = ckpt0 || '';
+      }
+      const ckpt1Input = document.getElementById('ckpt-1');
+      if (ckpt1Input && document.activeElement !== ckpt1Input) {
+        ckpt1Input.value = ckpt1 || '';
+      }
+      const ckpt0Status = document.getElementById('ckpt-0-status');
+      if (ckpt0Status) {
+        ckpt0Status.textContent = ckpt0 ? ckpt0 : 'random';
+      }
+      const ckpt1Status = document.getElementById('ckpt-1-status');
+      if (ckpt1Status) {
+        ckpt1Status.textContent = ckpt1 ? ckpt1 : 'random';
+      }
       root.innerHTML = '';
 
       const board = document.createElement('div');
@@ -197,6 +261,7 @@ HTML_PAGE = """
       const tCards = document.createElement('div'); tCards.className='cards-row';
       state.players[2].hand.forEach(c => tCards.appendChild(cardDiv(c, highlightIds)));
       top.appendChild(tTitle); top.appendChild(tCards);
+      if (activeSeat === 2) { top.classList.add('active-player'); }
       board.appendChild(document.createElement('div')); // spacer
       board.appendChild(top);
       board.appendChild(document.createElement('div')); // spacer
@@ -206,6 +271,7 @@ HTML_PAGE = """
       const lTitle = document.createElement('div'); lTitle.className='title'; lTitle.textContent = `player_3 (side ${state.players[3].side})`;
       left.appendChild(lTitle);
       state.players[3].hand.forEach(c => left.appendChild(cardDiv(c, highlightIds)));
+      if (activeSeat === 3) { left.classList.add('active-player'); }
       board.appendChild(left);
 
       const table = document.createElement('div'); table.className='zone';
@@ -219,6 +285,7 @@ HTML_PAGE = """
       const rTitle = document.createElement('div'); rTitle.className='title'; rTitle.textContent = `player_1 (side ${state.players[1].side})`;
       right.appendChild(rTitle);
       state.players[1].hand.forEach(c => right.appendChild(cardDiv(c, highlightIds)));
+      if (activeSeat === 1) { right.classList.add('active-player'); }
       board.appendChild(right);
 
       // Bottom (player 0)
@@ -227,6 +294,7 @@ HTML_PAGE = """
       const bCards = document.createElement('div'); bCards.className='cards-row';
       state.players[0].hand.forEach(c => bCards.appendChild(cardDiv(c, highlightIds)));
       bottom.appendChild(bTitle); bottom.appendChild(bCards);
+      if (activeSeat === 0) { bottom.classList.add('active-player'); }
       board.appendChild(document.createElement('div'));
       board.appendChild(bottom);
       board.appendChild(document.createElement('div'));
@@ -236,7 +304,8 @@ HTML_PAGE = """
         status.textContent = `Finished. Scores: ${JSON.stringify(state.scores)}`;
         if (autoTimer) { clearInterval(autoTimer); autoTimer = null; document.getElementById('auto').checked = false; }
       } else {
-        status.textContent = `Current: ${state.agent} | Mode: ${state.mode}`;
+        const seatLabel = activeSeat >= 0 ? ` (seat ${activeSeat})` : '';
+        status.textContent = `Current: ${state.agent}${seatLabel} | Mode: ${state.mode}`;
       }
     }
 
@@ -268,6 +337,34 @@ HTML_PAGE = """
       }
     }
 
+    async function applyCheckpoint(team) {
+      const input = document.getElementById(`ckpt-${team}`);
+      const value = input ? input.value.trim() : '';
+      try {
+        const st = await api('/checkpoint', 'POST', { team, checkpoint: value || null });
+        render(st);
+      } catch (err) {
+        console.error(err);
+        alert(err.message || err);
+        await refresh();
+      }
+    }
+
+    async function clearCheckpoint(team) {
+      const input = document.getElementById(`ckpt-${team}`);
+      if (input && document.activeElement !== input) {
+        input.value = '';
+      }
+      try {
+        const st = await api('/checkpoint', 'POST', { team, checkpoint: null });
+        render(st);
+      } catch (err) {
+        console.error(err);
+        alert(err.message || err);
+        await refresh();
+      }
+    }
+
     window.addEventListener('load', refresh);
   </script>
 </head>
@@ -284,6 +381,18 @@ HTML_PAGE = """
     <button onclick="doStep()">Step</button>
     <label><input id="auto" type="checkbox" onchange="toggleAuto(this)"/> Auto</label>
     <label>Interval(ms): <input id="interval" type="number" value="500" style="width:80px"/></label>
+    <div class="checkpoint-group">
+      <label>Team 0 ckpt: <input id="ckpt-0" type="text" placeholder="path/to_checkpoint.pkl" style="width:220px" /></label>
+      <button onclick="applyCheckpoint(0)">Load</button>
+      <button onclick="clearCheckpoint(0)">Clear</button>
+      <span class="checkpoint-status">Team0: <span id="ckpt-0-status">random</span></span>
+    </div>
+    <div class="checkpoint-group">
+      <label>Team 1 ckpt: <input id="ckpt-1" type="text" placeholder="path/to_checkpoint.pkl" style="width:220px" /></label>
+      <button onclick="applyCheckpoint(1)">Load</button>
+      <button onclick="clearCheckpoint(1)">Clear</button>
+      <span class="checkpoint-status">Team1: <span id="ckpt-1-status">random</span></span>
+    </div>
     <div id="status" class="status">Ready</div>
   </div>
   <div id="root"></div>
@@ -292,26 +401,17 @@ HTML_PAGE = """
 """
 
 
-def create_app(checkpoint: Optional[str], mode: str, seed: int, log_dir: Optional[str] = None) -> Flask:
+def create_app(team0_checkpoint: Optional[str], team1_checkpoint: Optional[str], mode: str, seed: int, log_dir: Optional[str] = None) -> Flask:
     app = Flask(__name__)
     tlog = TLogger(log_dir=log_dir or ("runs/web/" + time.strftime("%Y-%m-%d-%H-%M-%S")))
     env = make_env(tlog)
-    actor = None
-    if checkpoint:
-        load_errors = []
-        for label, loader in (
-            ("CFR average policy", lambda: CFRTrainer.load_avg_policy(checkpoint, seed=seed)),
-            ("CTDE actor", lambda: CTDETrainer.load_policy(checkpoint, seed=seed)),
-        ):
+    gm = GameManager(tlog=tlog, env=env, mode=mode, seed=seed)
+    for team, ckpt in ((0, team0_checkpoint), (1, team1_checkpoint)):
+        if ckpt:
             try:
-                actor = loader()
-                break
+                gm.load_checkpoint(team, ckpt)
             except Exception as exc:
-                load_errors.append(f"{label}: {exc}")
-        if actor is None and load_errors:
-            joined = "; ".join(load_errors)
-            print(f"WARNING: failed to load checkpoint '{checkpoint}': {joined}")
-    gm = GameManager(tlog=tlog, env=env, actor=actor, mode=mode, seed=seed)
+                print(f"WARNING: failed to load checkpoint for team {team} from '{ckpt}': {exc}")
     gm.reset(mode=mode, seed=seed)
 
     @app.get('/')
@@ -333,19 +433,38 @@ def create_app(checkpoint: Optional[str], mode: str, seed: int, log_dir: Optiona
         gm.reset(mode=data.get('mode'), seed=data.get('seed'))
         return jsonify(gm.state())
 
+    @app.post('/checkpoint')
+    def set_checkpoint() -> Response:
+        data = request.get_json(silent=True) or {}
+        team = data.get('team')
+        checkpoint = data.get('checkpoint')
+        try:
+            team_idx = int(team)
+        except (TypeError, ValueError):
+            return Response('Invalid team index', status=400)
+        try:
+            gm.load_checkpoint(team_idx, checkpoint)
+        except Exception as exc:
+            return Response(f'Failed to load checkpoint: {exc}', status=400)
+        return jsonify(gm.state())
+
     return app
 
 
 def main():
     parser = argparse.ArgumentParser(description='Scopa web viewer')
-    parser.add_argument('--checkpoint', type=str, default='', help='Path to saved checkpoint (.pkl) for policy (optional)')
+    parser.add_argument('--checkpoint', type=str, default='', help='Legacy shorthand for --team0-checkpoint')
+    parser.add_argument('--team0-checkpoint', type=str, default='', help='Checkpoint path controlling seats 0 & 2')
+    parser.add_argument('--team1-checkpoint', type=str, default='', help='Checkpoint path controlling seats 1 & 3')
     parser.add_argument('--mode', type=str, default='selfplay', choices=['selfplay', 'vs_random'], help='Self-play or policy team vs random')
     parser.add_argument('--seed', type=int, default=123, help='Seed for randomness')
     parser.add_argument('--host', type=str, default='0.0.0.0', help='Host to bind')
     parser.add_argument('--port', type=int, default=7860, help='Port to bind')
     args = parser.parse_args()
 
-    app = create_app(args.checkpoint or None, args.mode, args.seed)
+    team0_ckpt = args.team0_checkpoint or (args.checkpoint or None)
+    team1_ckpt = args.team1_checkpoint or None
+    app = create_app(team0_ckpt, team1_ckpt, args.mode, args.seed)
     # threaded to allow multiple quick requests during auto-play
     app.run(host=args.host, port=args.port, debug=False, threaded=True)
 
