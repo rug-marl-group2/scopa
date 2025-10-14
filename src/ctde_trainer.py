@@ -52,11 +52,11 @@ def mask_logits(logits: Array, mask: Array) -> Array:
 
 _RECOMMENDED_METRIC_WEIGHTS = {
     "win": 2.0,
-    "points": 0.35,
+    "points": 0.05,
     "scopa": 0.75,
-    "most_cards": 0.25,
-    "most_coins": 0.25,
-    "sette_bello": 0.3,
+    "most_cards": 0.50,
+    "most_coins": 0.45,
+    "sette_bello": 0.7,
     "primiera": 0.3,
 }
 

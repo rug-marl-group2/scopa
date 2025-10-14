@@ -172,20 +172,15 @@ def is_terminal(state: State) -> jnp.ndarray:
 
 @jax.jit
 def build_observation(state: State, seat: jnp.ndarray) -> jnp.ndarray:
-    # 6x40 planes: hand, table, captures(me+friend), histories(enemy1, enemy2, friend)
+    # 4x40 planes: hand, table, captures(me+friend), history(friend)
     friend = (seat + 2) % 4
-    # Enemies in env order: the two other players, then friend as last "other"
-    # For deterministic ordering, pick (seat+1)%4, (seat+3)%4 as enemies, friend last
-    enemy1 = (seat + 1) % 4
-    enemy2 = (seat + 3) % 4
 
-    out = jnp.zeros((6, NUM_CARDS), dtype=jnp.float32)
+    out = jnp.zeros((4, NUM_CARDS), dtype=jnp.float32)
     out = out.at[0].set(state.hands[seat].astype(jnp.float32))
     out = out.at[1].set(state.table.astype(jnp.float32))
-    out = out.at[2].set((state.captures[seat] + state.captures[friend]).clip(max=1).astype(jnp.float32))
-    out = out.at[3].set(state.history[enemy1].astype(jnp.float32))
-    out = out.at[4].set(state.history[enemy2].astype(jnp.float32))
-    out = out.at[5].set(state.history[friend].astype(jnp.float32))
+    captures = (state.captures[seat] + state.captures[friend]).clip(max=1)
+    out = out.at[2].set(captures.astype(jnp.float32))
+    out = out.at[3].set(state.history[friend].astype(jnp.float32))
     return out
 
 

@@ -1,6 +1,6 @@
 from typing import Dict, Tuple, Optional, Union
 from dataclasses import dataclass
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 import os
 import pickle
 
@@ -22,6 +22,11 @@ NUM_CARDS = NUM_SUITS * NUM_RANKS
 # Index metadata
 CARD_RANKS = np.concatenate([np.arange(1, NUM_RANKS + 1, dtype=np.int32) for _ in range(NUM_SUITS)])
 CARD_SUITS = np.concatenate([np.full((NUM_RANKS,), si, dtype=np.int32) for si in range(NUM_SUITS)])
+
+TEAM0_MASK = np.array([1, 0, 1, 0], dtype=np.int32)
+TEAM1_MASK = np.array([0, 1, 0, 1], dtype=np.int32)
+TEAM_INDEX = np.array([0, 1, 0, 1], dtype=np.int32)
+PRIMIERA_PRIORITY = np.array([0, 2, 0, 0, 0, 1, 3, 4, 0, 0, 0], dtype=np.int32)
 
 
 class NState:
@@ -137,57 +142,97 @@ def np_is_terminal(st: NState) -> bool:
     return int(st.hands.sum()) == 0
 
 
-def np_evaluate_round(st: NState) -> tuple[int, int]:
+def np_final_captures(st: NState) -> np.ndarray:
     captures = st.captures.copy()
-    table = st.table.copy()
     if int(st.last_capture_player) >= 0:
         seat = int(st.last_capture_player)
-        captures[seat] = np.clip(captures[seat] + table, 0, 1)
-        table[:] = 0
-    # Team captures
-    team0_mask = np.array([1, 0, 1, 0], dtype=np.int32)
-    team1_mask = np.array([0, 1, 0, 1], dtype=np.int32)
-    team0_caps = (captures.T @ team0_mask).astype(np.int32)
-    team1_caps = (captures.T @ team1_mask).astype(np.int32)
+        captures[seat] = np.clip(captures[seat] + st.table, 0, 1)
+    return captures
 
-    t0 = 0
-    t1 = 0
 
-    # Scopas
-    t0 += int(st.scopas @ team0_mask)
-    t1 += int(st.scopas @ team1_mask)
+def _distribute_point(team_points: np.ndarray, player_points: np.ndarray, team_idx: int, seats: tuple[int, int], totals: float, counts: np.ndarray, value: float = 1.0) -> None:
+    """Add `value` reward to a team and share to individual seats."""
+    team_points[team_idx] += value
+    if totals > 0.0:
+        weights = [counts[seat] / float(totals) for seat in seats]
+    else:
+        weights = [1.0 / len(seats)] * len(seats)
+    for seat, w in zip(seats, weights):
+        player_points[seat] += value * float(w)
 
-    # Most cards
-    c0 = int(team0_caps.sum())
-    c1 = int(team1_caps.sum())
-    t0 += 1 if c0 > c1 else 0
-    t1 += 1 if c1 > c0 else 0
 
-    # Most coins (suit == bello -> suit_id 3)
+def np_round_scores(st: NState) -> tuple[np.ndarray, np.ndarray]:
+    """Return (team_points, player_points) for a terminal state."""
+    captures = np_final_captures(st)
+
+    team0_caps = (captures.T @ TEAM0_MASK).astype(np.int32)
+    team1_caps = (captures.T @ TEAM1_MASK).astype(np.int32)
+    card_counts = captures.sum(axis=1).astype(np.int32)
+    team_card_counts = np.array([
+        int(card_counts[0] + card_counts[2]),
+        int(card_counts[1] + card_counts[3]),
+    ], dtype=np.int32)
+
     is_bello = (CARD_SUITS == 3).astype(np.int32)
-    b0 = int((team0_caps * is_bello).sum())
-    b1 = int((team1_caps * is_bello).sum())
-    t0 += 1 if b0 > b1 else 0
-    t1 += 1 if b1 > b0 else 0
+    coin_counts = (captures * is_bello).sum(axis=1).astype(np.int32)
+    team_coin_counts = np.array([
+        int(coin_counts[0] + coin_counts[2]),
+        int(coin_counts[1] + coin_counts[3]),
+    ], dtype=np.int32)
 
-    # Sette bello
+    player_points = np.zeros(4, dtype=np.float32)
+    team_points = np.zeros(2, dtype=np.float32)
+
+    # Scopa points accrue to the player who completed them.
+    scopa_counts = st.scopas.astype(np.float32)
+    player_points += scopa_counts
+    team_points[0] += float(scopa_counts[0] + scopa_counts[2])
+    team_points[1] += float(scopa_counts[1] + scopa_counts[3])
+
+    # Most cards bonus.
+    if team_card_counts[0] > team_card_counts[1]:
+        _distribute_point(team_points, player_points, 0, (0, 2), float(team_card_counts[0]), card_counts)
+    elif team_card_counts[1] > team_card_counts[0]:
+        _distribute_point(team_points, player_points, 1, (1, 3), float(team_card_counts[1]), card_counts)
+
+    # Most coins bonus.
+    if team_coin_counts[0] > team_coin_counts[1]:
+        _distribute_point(team_points, player_points, 0, (0, 2), float(team_coin_counts[0]), coin_counts)
+    elif team_coin_counts[1] > team_coin_counts[0]:
+        _distribute_point(team_points, player_points, 1, (1, 3), float(team_coin_counts[1]), coin_counts)
+
+    # Sette bello goes to the player who captured it.
     sette_bello_idx = 3 * NUM_RANKS + (7 - 1)
-    t0 += 1 if team0_caps[sette_bello_idx] > 0 else 0
-    t1 += 1 if team1_caps[sette_bello_idx] > 0 else 0
+    sette_owner = np.nonzero(captures[:, sette_bello_idx])[0]
+    if sette_owner.size > 0:
+        seat = int(sette_owner[0])
+        team_idx = TEAM_INDEX[seat]
+        team_points[team_idx] += 1.0
+        player_points[seat] += 1.0
 
-    # Primiera priorities
-    RANK_PRIORITY = np.array([0, 2, 0, 0, 0, 1, 3, 4, 0, 0, 0], dtype=np.int32)
-    pri = RANK_PRIORITY[1:]
-    by_suit_rank0 = team0_caps.reshape(NUM_SUITS, NUM_RANKS)
-    by_suit_rank1 = team1_caps.reshape(NUM_SUITS, NUM_RANKS)
-    prim0 = int((by_suit_rank0 * pri).max(axis=1).sum())
-    prim1 = int((by_suit_rank1 * pri).max(axis=1).sum())
-    t0 += 1 if prim0 > prim1 else 0
-    t1 += 1 if prim1 > prim0 else 0
+    # Primiera bonus: distribute according to each player's contribution.
+    player_primiera = np.zeros(4, dtype=np.float32)
+    pri = PRIMIERA_PRIORITY[1:]
+    for seat in range(4):
+        cards = captures[seat].reshape(NUM_SUITS, NUM_RANKS)
+        player_primiera[seat] = float((cards * pri).max(axis=1).sum())
+    team_primiera = np.array([
+        float(player_primiera[0] + player_primiera[2]),
+        float(player_primiera[1] + player_primiera[3]),
+    ], dtype=np.float32)
+    if team_primiera[0] > team_primiera[1]:
+        _distribute_point(team_points, player_points, 0, (0, 2), float(team_primiera[0]), player_primiera)
+    elif team_primiera[1] > team_primiera[0]:
+        _distribute_point(team_points, player_points, 1, (1, 3), float(team_primiera[1]), player_primiera)
 
-    if t0 > t1:
+    return team_points, player_points
+
+
+def np_evaluate_round(st: NState) -> tuple[int, int]:
+    team_points, _ = np_round_scores(st)
+    if team_points[0] > team_points[1]:
         return 1, -1
-    if t1 > t0:
+    if team_points[1] > team_points[0]:
         return -1, 1
     return 0, 0
 
@@ -216,7 +261,7 @@ class CFRTrainer:
                  regret_prune: bool = True, prune_threshold: float = -0.05,
                  prune_warmup: int = 32, prune_reactivation: int = 8,
                  subset_cache_size: int = 8192, max_branch_actions: int = 0,
-                 rollout_depth: int = 0, rollout_samples: int = 0):
+                 rollout_depth: int = 0, rollout_samples: int = 0, reward_mode: str = "team"):
         self.tlogger = tlogger
         self.rm_plus = bool(rm_plus)
         bt = branch_topk  # limit branching at traverser nodes for speed
@@ -241,6 +286,10 @@ class CFRTrainer:
         self.rollout_depth = rd
         self.rollout_samples = max(int(rollout_samples), 1) if rd is not None else 0
         self._max_rollout_steps = NUM_CARDS * 2
+        mode = str(reward_mode).lower()
+        if mode not in ("team", "selfish"):
+            raise ValueError(f"Unsupported reward_mode: {reward_mode}")
+        self.reward_mode = mode
 
         # Memory controls
         self.max_infosets = int(max_infosets) if (max_infosets is not None and max_infosets > 0) else None
@@ -559,12 +608,28 @@ class CFRTrainer:
         return choice
 
     def _evaluate_utility(self, st: NState, seat: int) -> float:
-        t0, t1 = np_evaluate_round(st)
-        return float(t0 if (seat % 2 == 0) else t1)
+        team_points, player_points = np_round_scores(st)
+        team_idx = TEAM_INDEX[seat]
+        other_team = 1 - team_idx
+        team_advantage = float(team_points[team_idx] - team_points[other_team])
+        if self.reward_mode == "team":
+            sign = 0.0
+            if team_advantage > 0.0:
+                sign = 1.0
+            elif team_advantage < 0.0:
+                sign = -1.0
+            return sign if team_idx == 0 else -sign
+
+        team_total = float(team_points[team_idx])
+        if team_total > 0.0:
+            weight = float(player_points[seat]) / team_total
+        else:
+            weight = 0.5
+        return team_advantage * weight
 
     def _obs_key(self, obs: np.ndarray) -> bytes:
         """Bit-pack observation planes to bytes (exactly like SavedPolicy).
-        Full: 6×40 -> 30 bytes; compact: 3×40 -> 15B; hand_table: 2×40 -> 10B.
+        Full: 4x40 -> 20 bytes; compact: 3x40 -> 15B; hand_table: 2x40 -> 10B.
         """
         mode = self.obs_key_mode
         if mode == "hand_table":
@@ -727,64 +792,70 @@ class CFRTrainer:
     # --------------------------
     # Evaluation utilities
     # --------------------------
-    def _category_breakdown(self, st: NState) -> Dict[str, int]:
-        """Compute Scopa category wins and counts for each team from terminal state."""
-        # Team masks (team 0: seats 0 and 2; team 1: seats 1 and 3)
-        team0_mask = np.array([1, 0, 1, 0], dtype=np.int32)
-        team1_mask = np.array([0, 1, 0, 1], dtype=np.int32)
+    def _category_breakdown(self, st: NState) -> Dict[str, float]:
+        """Compute Scopa category wins, points, and collaboration metrics."""
+        captures = np_final_captures(st)
+        team0_caps = (captures.T @ TEAM0_MASK).astype(np.int32)
+        team1_caps = (captures.T @ TEAM1_MASK).astype(np.int32)
 
-        team0_caps = (st.captures.T @ team0_mask).astype(np.int32)
-        team1_caps = (st.captures.T @ team1_mask).astype(np.int32)
+        scopa0 = int(st.scopas @ TEAM0_MASK)
+        scopa1 = int(st.scopas @ TEAM1_MASK)
 
-        # Scopas (counts)
-        scopa0 = int(st.scopas @ team0_mask)
-        scopa1 = int(st.scopas @ team1_mask)
+        cards_per_player = captures.sum(axis=1).astype(np.int32)
+        cards_team0 = int(cards_per_player[0] + cards_per_player[2])
+        cards_team1 = int(cards_per_player[1] + cards_per_player[3])
+        mc0 = 1 if cards_team0 > cards_team1 else 0
+        mc1 = 1 if cards_team1 > cards_team0 else 0
 
-        # Most cards
-        c0 = int(team0_caps.sum())
-        c1 = int(team1_caps.sum())
-        mc0 = 1 if c0 > c1 else 0
-        mc1 = 1 if c1 > c0 else 0
-
-        # Most coins (bello suit == 3)
         is_bello = (CARD_SUITS == 3).astype(np.int32)
-        b0 = int((team0_caps * is_bello).sum())
-        b1 = int((team1_caps * is_bello).sum())
-        mb0 = 1 if b0 > b1 else 0
-        mb1 = 1 if b1 > b0 else 0
+        coins_per_player = (captures * is_bello).sum(axis=1).astype(np.int32)
+        coins_team0 = int(coins_per_player[0] + coins_per_player[2])
+        coins_team1 = int(coins_per_player[1] + coins_per_player[3])
+        mb0 = 1 if coins_team0 > coins_team1 else 0
+        mb1 = 1 if coins_team1 > coins_team0 else 0
 
-        # Sette bello
         sette_bello_idx = 3 * NUM_RANKS + (7 - 1)
         sb0 = 1 if team0_caps[sette_bello_idx] > 0 else 0
         sb1 = 1 if team1_caps[sette_bello_idx] > 0 else 0
 
-        # Primiera (priority values consistent with env scoring)
-        RANK_PRIORITY = np.array([0, 2, 0, 0, 0, 1, 3, 4, 0, 0, 0], dtype=np.int32)
-        pri = RANK_PRIORITY[1:]
-        by_suit_rank0 = team0_caps.reshape(NUM_SUITS, NUM_RANKS)
-        by_suit_rank1 = team1_caps.reshape(NUM_SUITS, NUM_RANKS)
-        prim0 = int((by_suit_rank0 * pri).max(axis=1).sum())
-        prim1 = int((by_suit_rank1 * pri).max(axis=1).sum())
-        pr0 = 1 if prim0 > prim1 else 0
-        pr1 = 1 if prim1 > prim0 else 0
+        pri = PRIMIERA_PRIORITY[1:]
+        primiera_per_player = np.zeros(4, dtype=np.float32)
+        for seat in range(4):
+            cards = captures[seat].reshape(NUM_SUITS, NUM_RANKS)
+            primiera_per_player[seat] = float((cards * pri).max(axis=1).sum())
+        prim0_val = float(primiera_per_player[0] + primiera_per_player[2])
+        prim1_val = float(primiera_per_player[1] + primiera_per_player[3])
+        pr0 = 1 if prim0_val > prim1_val else 0
+        pr1 = 1 if prim1_val > prim0_val else 0
 
-        # Aggregate points (category points + scopas)
         points0 = scopa0 + mc0 + mb0 + sb0 + pr0
         points1 = scopa1 + mc1 + mb1 + sb1 + pr1
 
+        team_points, player_points = np_round_scores(st)
+        inter_delta = float(team_points[0] - team_points[1])
+        intra_delta = 0.5 * (abs(player_points[0] - player_points[2]) + abs(player_points[1] - player_points[3]))
+
         return {
-            "points0": points0,
-            "points1": points1,
-            "scopas0": scopa0,
-            "scopas1": scopa1,
-            "most_cards0": mc0,
-            "most_cards1": mc1,
-            "most_coins0": mb0,
-            "most_coins1": mb1,
-            "sette_bello0": sb0,
-            "sette_bello1": sb1,
-            "primiera0": pr0,
-            "primiera1": pr1,
+            "points0": float(points0),
+            "points1": float(points1),
+            "scopas0": float(scopa0),
+            "scopas1": float(scopa1),
+            "most_cards0": float(mc0),
+            "most_cards1": float(mc1),
+            "most_coins0": float(mb0),
+            "most_coins1": float(mb1),
+            "sette_bello0": float(sb0),
+            "sette_bello1": float(sb1),
+            "primiera0": float(pr0),
+            "primiera1": float(pr1),
+            "team_points0": float(team_points[0]),
+            "team_points1": float(team_points[1]),
+            "player_points0": float(player_points[0]),
+            "player_points1": float(player_points[1]),
+            "player_points2": float(player_points[2]),
+            "player_points3": float(player_points[3]),
+            "inter_team_delta": inter_delta,
+            "intra_team_delta": float(intra_delta),
         }
 
     def _select_action_eval(self, st: NState, seat: int, mode: str,
@@ -858,15 +929,8 @@ class CFRTrainer:
         wins0 = 0
         wins1 = 0
         draws = 0
-        # Category sums
-        sums = {
-            "points0": 0.0, "points1": 0.0,
-            "scopas0": 0.0, "scopas1": 0.0,
-            "most_cards0": 0.0, "most_cards1": 0.0,
-            "most_coins0": 0.0, "most_coins1": 0.0,
-            "sette_bello0": 0.0, "sette_bello1": 0.0,
-            "primiera0": 0.0, "primiera1": 0.0,
-        }
+        # Category sums (auto-extend to new metrics)
+        sums = defaultdict(float)
 
         for ep in range(episodes):
             st = np_init_state(Generator(PCG64(seed + 1000 + ep)))
@@ -882,7 +946,8 @@ class CFRTrainer:
                 st, _ = np_step(st, a)
 
             cat = self._category_breakdown(st)
-            sums = {k: sums[k] + float(cat[k]) for k in sums}
+            for k, v in cat.items():
+                sums[k] += float(v)
             if cat["points0"] > cat["points1"]:
                 wins0 += 1
             elif cat["points1"] > cat["points0"]:
@@ -905,12 +970,23 @@ class CFRTrainer:
     def train(self, iterations: int = 1000, seed: int = 42, verbose: bool = False, log_every: int = 100,
             eval_every: Optional[int] = None, eval_episodes: int = 32, eval_use_avg_policy: bool = True,
             batch_size: Optional[int] = None, traversals_per_deal: Optional[int] = 1,
-            best_save_path: Optional[str] = None, best_save_kind: Optional[str] = None):
+            best_save_path: Optional[str] = None, best_save_kind: Optional[str] = None,
+            branch_topk_decay: float = 1.0, branch_topk_min: Optional[int] = None):
         """Run MCCFR for a given number of iterations with mini-batching.
 
         Each iteration samples B independent deals and accumulates regrets/strategy.
         """
         for it in trange(1, iterations + 1, desc="Iter"):
+            if self.branch_topk is not None:
+                min_cap = branch_topk_min if branch_topk_min is not None else 1
+                if min_cap <= 0:
+                    min_cap = 1
+                if branch_topk_decay < 1.0:
+                    new_val = max(int(self.branch_topk * branch_topk_decay), min_cap)
+                    if new_val != self.branch_topk:
+                        self.branch_topk = new_val
+                elif branch_topk_decay > 1.0:
+                    self.branch_topk = max(int(self.branch_topk * branch_topk_decay), self.branch_topk)
             B = int(batch_size) if (batch_size is not None) else int(getattr(self, "batch_size", 1))
             if B <= 0:
                 B = 1

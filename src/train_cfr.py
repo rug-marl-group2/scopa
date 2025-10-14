@@ -89,13 +89,16 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--iters", type=int, default=1000)
     parser.add_argument("--batch_size", type=int, default=4, help="Deals per iteration for MCCFR mini-batch")
-    parser.add_argument("--traversals_per_deal", type=int, default=1, help="Number of target seats sampled per deal (<=0 traverses all seats)")
+    parser.add_argument("--traversals_per_deal", type=int, default=3, help="Number of target seats sampled per deal (<=0 traverses all seats)")
     parser.add_argument("--rm_plus", action="store_true", default=True, help="Use RM+ (regret clamping)")
+    parser.add_argument("--reward_mode", type=str, default="team", choices=["team", "selfish"], help="Select team-shared or selfish utility shaping")
     parser.add_argument("--seed", type=int, default=time.time_ns())
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--log_every", type=int, default=100)
-    parser.add_argument("--branch_topk", type=int, default=5, help="Limit traverser branching to top-K actions by current policy; 0 disables pruning (full branching, correct CFR)")
-    parser.add_argument("--max_branch_actions", type=int, default=4, help="Hard cap on traverser actions explored per infoset (0 = unlimited)")
+    parser.add_argument("--branch_topk", type=int, default=10, help="Initial top-K restriction during traversal; 0 disables pruning (full branching)")
+    parser.add_argument("--branch_topk_decay", type=float, default=0, help="Multiplicative decay applied to branch_topk after each iteration")
+    parser.add_argument("--branch_topk_min", type=int, default=10, help="Lower bound for branch_topk during decay")
+    parser.add_argument("--max_branch_actions", type=int, default=0, help="Hard cap on traverser actions explored per infoset (0 = unlimited)")
     parser.add_argument("--pw_alpha", type=float, default=0.3, help="Progressive widening growth exponent")
     parser.add_argument("--pw_tail", type=int, default=3, help="Base number of tail actions sampled alongside top-K")
     parser.add_argument("--prune_threshold", type=float, default=-0.05, help="Regret pruning threshold (actions below are skipped)")
@@ -138,7 +141,8 @@ def main():
                          subset_cache_size=args.subset_cache_size,
                          max_branch_actions=args.max_branch_actions,
                          rollout_depth=args.rollout_depth,
-                         rollout_samples=args.rollout_samples
+                         rollout_samples=args.rollout_samples,
+                         reward_mode=args.reward_mode
                          )
     best_save_path = args.best_save_path if args.best_save_path else os.path.join(tlog.get_log_dir(), f"policy_{args.save_kind}_best.pkl")
 
@@ -153,7 +157,9 @@ def main():
         batch_size=args.batch_size,
         best_save_path=best_save_path,
         best_save_kind=args.save_kind,
-        traversals_per_deal=args.traversals_per_deal
+        traversals_per_deal=args.traversals_per_deal,
+        branch_topk_decay=args.branch_topk_decay,
+        branch_topk_min=args.branch_topk_min
     )
 
     # Save trained model/policy (default inside run dir)

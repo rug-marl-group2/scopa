@@ -68,6 +68,26 @@ class GameManager:
     actors: Dict[int, Optional[Any]] = field(default_factory=lambda: {0: None, 1: None})
     checkpoints: Dict[int, Optional[str]] = field(default_factory=lambda: {0: None, 1: None})
     last_move: Optional[Dict[str, Any]] = None
+    event_log: List[Dict[str, Any]] = field(default_factory=list)
+    log_limit: int = 300
+    turn_count: int = 0
+    _round_logged: bool = field(default=False, init=False, repr=False)
+
+    def _log_event(self, event: str, **details: Any) -> Dict[str, Any]:
+        entry = {'ts': time.time(), 'event': event, 'seq': len(self.event_log) + 1}
+        entry.update(details)
+        entry.setdefault('summary', event)
+        self.event_log.append(entry)
+        if len(self.event_log) > self.log_limit:
+            self.event_log = self.event_log[-self.log_limit:]
+        return entry
+
+    def get_log(self, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        if limit is None:
+            limit = min(200, self.log_limit)
+        limit = max(int(limit), 1)
+        entries = self.event_log[-limit:] if len(self.event_log) > limit else list(self.event_log)
+        return [dict(entry) for entry in entries]
 
     def reset(self, mode: Optional[str] = None, seed: Optional[int] = None) -> None:
         if mode is not None:
@@ -76,10 +96,16 @@ class GameManager:
             self.seed = int(seed)
         # Advance seed for variety
         self.seed += 1
-        random.seed(self.seed)
-        np.random.seed(self.seed)
-        self.env.reset(seed=self.seed)
+        current_seed = int(self.seed)
+        random.seed(current_seed)
+        np.random.seed(current_seed)
+        self.env.reset(seed=current_seed)
         self.last_move = None
+        self.turn_count = 0
+        self._round_logged = False
+        self.event_log.clear()
+        checkpoint_view = {0: self.checkpoints.get(0) or "random", 1: self.checkpoints.get(1) or "random"}
+        self._log_event("reset", summary=f"Reset game (mode={self.mode}, seed={current_seed})", mode=self.mode, seed=current_seed, checkpoints=checkpoint_view)
 
     def load_checkpoint(self, team: int, checkpoint: Optional[str]) -> None:
         if team not in self.actors:
@@ -88,9 +114,12 @@ class GameManager:
             actor = load_any_policy(checkpoint, seed=int(self.seed) + int(team) * 7)
             self.actors[team] = actor
             self.checkpoints[team] = checkpoint
+            summary = f"Team {team} loaded checkpoint {checkpoint}"
         else:
             self.actors[team] = None
             self.checkpoints[team] = None
+            summary = f"Team {team} reverted to random policy"
+        self._log_event("checkpoint", summary=summary, team=int(team), checkpoint=checkpoint)
 
     def _select_action(self, seat: int, obs: np.ndarray, mask: np.ndarray) -> int:
         legal = [i for i, m in enumerate(mask) if m == 1]
@@ -113,6 +142,8 @@ class GameManager:
 
     def step(self) -> None:
         agent = self.env.agent_selection
+        if agent is None:
+            return
         if self.env.terminations[agent] or self.env.truncations[agent]:
             return
         seat = self.env.agent_name_mapping[agent]
@@ -120,10 +151,13 @@ class GameManager:
         obs = self.env.observations[agent]
         mask = self.env.infos[agent]["action_mask"]
 
+        legal = [int(i) for i, m in enumerate(mask) if m == 1]
+        table_before = [card_id(c) for c in self.env.game.table]
+        hand_before = [card_id(c) for c in player.hand]
+
         action = self._select_action(seat, obs, mask)
-        # Determine capture set for highlight
-        highlight_ids = []
-        played_id = None
+        highlight_ids: List[str] = []
+        played_id: Optional[str] = None
         for c in list(player.hand):
             if card_to_index(c) == action:
                 played_id = card_id(c)
@@ -136,6 +170,13 @@ class GameManager:
                 break
 
         self.env.step(action)
+        self.turn_count += 1
+
+        table_after = [card_id(c) for c in self.env.game.table]
+        hand_after = [card_id(c) for c in self.env.game.players[seat].hand]
+        capture_text = f"captured {', '.join(highlight_ids)}" if highlight_ids else "no capture"
+        played_text = played_id or f"action-{action}"
+        summary = f"{agent} played {played_text} ({capture_text})"
 
         self.last_move = {
             'agent': agent,
@@ -144,17 +185,51 @@ class GameManager:
             'captured': highlight_ids,
         }
 
+        self._log_event(
+            'step',
+            summary=summary,
+            agent=agent,
+            seat=int(seat),
+            turn=self.turn_count,
+            action=int(action),
+            played=played_id,
+            captured=highlight_ids,
+            legal_actions=legal,
+            table_before=table_before,
+            table_after=table_after,
+            hand_before=hand_before,
+            hand_after=hand_after,
+            mode=self.mode,
+        )
+
+        done_now = all(self.env.terminations.values()) or all(self.env.truncations.values())
+        if done_now and not self._round_logged:
+            scores = list(self.env.roundScores())
+            self._log_event(
+                'round_end',
+                summary=f"Round finished: scores {scores}",
+                scores=scores,
+                mode=self.mode,
+                seed=int(self.seed),
+                turns=self.turn_count,
+            )
+            self._round_logged = True
+
     def state(self) -> Dict[str, Any]:
         agent = self.env.agent_selection
         done = False
-        if self.env.terminations[agent] or self.env.truncations[agent]:
+        if agent is None:
             done = True
+        else:
+            if self.env.terminations[agent] or self.env.truncations[agent]:
+                done = True
         players = self.env.game.players
-        return {
+        state = {
             'agent': agent,
             'done': done,
             'mode': self.mode,
             'seed': int(self.seed),
+            'turn': int(self.turn_count),
             'table': serialize_cards(self.env.game.table),
             'players': [
                 {
@@ -169,7 +244,11 @@ class GameManager:
                 0: self.checkpoints.get(0),
                 1: self.checkpoints.get(1),
             },
+            'log': self.get_log(),
+            'log_count': len(self.event_log),
+            'log_limit': self.log_limit,
         }
+        return state
 
 
 HTML_PAGE = """
@@ -182,7 +261,7 @@ HTML_PAGE = """
     body { font-family: system-ui, -apple-system, Arial, sans-serif; margin: 0; background: #ecf0f1; }
     .toolbar { display: flex; gap: 8px; align-items: center; padding: 10px; background: #fff; border-bottom: 1px solid #ccc; }
     .status { margin-left: auto; color: #2c3e50; }
-    .board { display: grid; grid-template-rows: 1fr auto 1fr; grid-template-columns: 1fr 1fr 1fr; height: calc(100vh - 54px); }
+    .board { display: grid; grid-template-rows: 1fr auto 1fr; grid-template-columns: 1fr 1fr 1fr; height: calc(100vh - 280px); }
     .zone { padding: 8px; border: 2px solid transparent; border-radius: 8px; transition: border-color 0.2s ease, background-color 0.2s ease; }
     .zone.active-player { border-color: #2980b9; background: rgba(41, 128, 185, 0.12); }
     .cards-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
@@ -198,6 +277,12 @@ HTML_PAGE = """
     .checkpoint-status { font-size: 12px; color: #34495e; }
     .checkpoint-group { display: flex; align-items: center; gap: 6px; }
     .toolbar input[type="text"] { padding: 2px 4px; }
+    .log-panel { max-height: 220px; overflow-y: auto; padding: 8px 12px; background: #fff; border-top: 1px solid #ccc; font-size: 12px; color: #2c3e50; }
+    .log-header { font-weight: 600; margin-bottom: 6px; }
+    .log-entry { margin-bottom: 4px; }
+    .log-entry:last-child { margin-bottom: 0; }
+    .log-entry .time { color: #7f8c8d; margin-right: 6px; font-family: monospace; }
+    .log-entry .event { font-weight: 600; margin-right: 6px; text-transform: uppercase; }
   </style>
   <script>
     let autoTimer = null;
@@ -307,6 +392,50 @@ HTML_PAGE = """
         const seatLabel = activeSeat >= 0 ? ` (seat ${activeSeat})` : '';
         status.textContent = `Current: ${state.agent}${seatLabel} | Mode: ${state.mode}`;
       }
+      const logDiv = document.getElementById('log');
+      if (logDiv) {
+        logDiv.innerHTML = '';
+        if (Array.isArray(state.log)) {
+          const total = typeof state.log_count === 'number' ? state.log_count : state.log.length;
+          const header = document.createElement('div');
+          header.className = 'log-header';
+          header.textContent = `Log (${state.log.length} shown of ${total})`;
+          logDiv.appendChild(header);
+          const entries = state.log.slice().reverse();
+          entries.forEach((entry) => {
+            const line = document.createElement('div');
+            line.className = 'log-entry';
+            const timeSpan = document.createElement('span');
+            timeSpan.className = 'time';
+            if (entry.ts) {
+              const ts = new Date(entry.ts * 1000);
+              timeSpan.textContent = ts.toLocaleTimeString();
+            } else {
+              timeSpan.textContent = '';
+            }
+            line.appendChild(timeSpan);
+            const eventSpan = document.createElement('span');
+            eventSpan.className = 'event';
+            eventSpan.textContent = entry.event || '';
+            line.appendChild(eventSpan);
+            const summarySpan = document.createElement('span');
+            summarySpan.textContent = entry.summary || '';
+            line.appendChild(summarySpan);
+            try {
+              line.title = JSON.stringify(entry, null, 2);
+            } catch (err) {
+              line.title = '';
+            }
+            logDiv.appendChild(line);
+          });
+          logDiv.scrollTop = logDiv.scrollHeight;
+        } else {
+          const msg = document.createElement('div');
+          msg.className = 'log-entry';
+          msg.textContent = 'Log unavailable';
+          logDiv.appendChild(msg);
+        }
+      }
     }
 
     async function refresh() {
@@ -396,6 +525,7 @@ HTML_PAGE = """
     <div id="status" class="status">Ready</div>
   </div>
   <div id="root"></div>
+  <div id="log" class="log-panel"></div>
 </body>
 </html>
 """

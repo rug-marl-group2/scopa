@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --mem=32GB
 #SBATCH --time=20:55:55
-#SBATCH --job-name=cfr_training
+#SBATCH --job-name=vcfrsup
 #SBATCH --partition=gpu
 #SBATCH --gres=gpu:v100:1
 #SBATCH --nodes=1
@@ -26,7 +26,8 @@ if [ "$#" -gt 0 ]; then
 fi
 
 if [ "$ALGO" = "ctde" ]; then
-    srun python scopa/src/train_ctde.py "$@"
+    srun python scopa/src/train_ctde.py --eval_vs_random "$@"
 else
-    srun python scopa/src/train_cfr.py --iters 1500 --log_every 10 --eval_every 50 --eval_eps 32 --eval_policy current --save_kind full --max_infosets 250000 "$@"
+    srun python scopa/src/train_cfr.py --iters 800 --log_every 5 --eval_every 25 --eval_eps 32 --eval_policy avg --save_kind full --max_infosets 400000 --batch_size 16 "$@"
 fi
+

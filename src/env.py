@@ -282,7 +282,7 @@ class MaScopaEnv(AECEnv):
             agent: spaces.Discrete(40) for agent in self.possible_agents
         }
         self._observation_spaces = {
-            agent: spaces.Box(0, 1, shape=(6, 40), dtype=np.float32) for agent in self.possible_agents
+            agent: spaces.Box(0, 1, shape=(4, 40), dtype=np.float32) for agent in self.possible_agents
         }
 
         self.reset()
@@ -314,73 +314,35 @@ class MaScopaEnv(AECEnv):
         feature_list = hands + [table] + captures + history + [scopas, current]
         return np.concatenate(feature_list).astype(np.float32, copy=False)
 
+
     def observe(self, agent):
         player_index = self.agent_name_mapping[agent]
-        if player_index == 0:
-            friend = self.game.players[2]
-            enemies = [self.game.players[1], self.game.players[3]]
-        elif player_index == 1:
-            friend = self.game.players[3]
-            enemies = [self.game.players[0], self.game.players[2]]
-        elif player_index == 2:
-            friend = self.game.players[0]
-            enemies = [self.game.players[1], self.game.players[3]]
-        elif player_index == 3:
-            friend = self.game.players[1]
-            enemies = [self.game.players[0], self.game.players[2]]
-
+        friend_index = (player_index + 2) % 4
         player = self.game.players[player_index]
-        state = np.zeros((6, 40))
+        friend = self.game.players[friend_index]
+
+        state = np.zeros((4, 40), dtype=np.float32)
+        offset = self._suit_offset
 
         for card in player.hand:
-            index = (card.rank - 1) + {
-                'cuori': 0,
-                'picche': 10,
-                'fiori': 20,
-                'bello': 30
-            }[card.suit]
-            state[0][index] = 1
+            index = (card.rank - 1) + offset[card.suit]
+            state[0][index] = 1.0
 
         for card in self.game.table:
-            index = (card.rank - 1) + {
-                'cuori': 0,
-                'picche': 10,
-                'fiori': 20,
-                'bello': 30
-            }[card.suit]
-            state[1][index] = 1
+            index = (card.rank - 1) + offset[card.suit]
+            state[1][index] = 1.0
 
         for card in player.captures:
-            index = (card.rank - 1) + {
-                'cuori': 0,
-                'picche': 10,
-                'fiori': 20,
-                'bello': 30
-            }[card.suit]
-            state[2][index] = 1
-        
+            index = (card.rank - 1) + offset[card.suit]
+            state[2][index] = 1.0
+
         for card in friend.captures:
-            index = (card.rank - 1) + {
-                'cuori': 0,
-                'picche': 10,
-                'fiori': 20,
-                'bello': 30
-            }[card.suit]
-            state[2][index] = 1
+            index = (card.rank - 1) + offset[card.suit]
+            state[2][index] = 1.0
 
-        enemies.append(friend)
-
-        others = enemies
-
-        for i, enemy in enumerate(others):
-            for card in enemy.history:
-                index = (card.rank - 1) + {
-                    'cuori': 0,
-                    'picche': 10,
-                    'fiori': 20,
-                    'bello': 30
-                }[card.suit]
-                state[3 + i][index] = 1
+        for card in friend.history:
+            index = (card.rank - 1) + offset[card.suit]
+            state[3][index] = 1.0
 
         return state
 
