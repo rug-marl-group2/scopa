@@ -4,6 +4,7 @@ from collections import OrderedDict, defaultdict
 import os
 import pickle
 import time
+import json
 
 import numpy as np
 from numpy.random import Generator, PCG64
@@ -462,7 +463,88 @@ class CFRTrainer:
         self.cum_regret: Dict[Tuple[int, bytes], np.ndarray] = {}
         self.cum_strategy: Dict[Tuple[int, bytes], np.ndarray] = {}
         self.best_vs_random_win_rate: float = float("-inf")
+        self._iter_stats: Optional[Dict[str, float]] = None
 
+    def _begin_iteration_stats(self) -> None:
+        """Reset per-iteration counters for debugging metrics."""
+        self._iter_stats = {}
+
+    def _stat_add(self, key: str, value: float) -> None:
+        if self._iter_stats is None:
+            return
+        self._iter_stats[key] = self._iter_stats.get(key, 0.0) + float(value)
+
+    def _stat_record_max(self, key: str, value: float) -> None:
+        if self._iter_stats is None:
+            return
+        val = float(value)
+        current = self._iter_stats.get(key)
+        if current is None or val > current:
+            self._iter_stats[key] = val
+
+    def _finalize_iteration_stats(self, iteration: int, emit: bool = True) -> None:
+        stats = self._iter_stats
+        self._iter_stats = None
+        if stats is None:
+            return
+        if not emit or self.tlogger is None:
+            return
+        writer = self.tlogger.writer
+        branch_calls = stats.get("branch_calls", 0.0)
+        total_legal = stats.get("branch_legal_total", 0.0)
+        total_post_prune = stats.get("branch_post_prune_total", 0.0)
+        total_selected = stats.get("branch_selected_total", 0.0)
+        width_total = stats.get("branch_width_cap_total", 0.0)
+        if branch_calls > 0:
+            writer.add_scalar("CFRDebug/branch_calls", branch_calls, iteration)
+            writer.add_scalar("CFRDebug/branch_avg_legal", total_legal / branch_calls, iteration)
+            writer.add_scalar("CFRDebug/branch_avg_after_prune", total_post_prune / branch_calls, iteration)
+            writer.add_scalar("CFRDebug/branch_avg_selected", total_selected / branch_calls, iteration)
+            writer.add_scalar("CFRDebug/branch_avg_width_cap", width_total / branch_calls if branch_calls > 0 else 0.0, iteration)
+        if total_legal > 0:
+            pruned = max(total_legal - total_post_prune, 0.0)
+            writer.add_scalar("CFRDebug/branch_prune_rate", pruned / total_legal, iteration)
+        writer.add_scalar("CFRDebug/branch_pruned_actions", stats.get("branch_pruned_actions", 0.0), iteration)
+        tail_samples = stats.get("branch_tail_samples", 0.0)
+        if branch_calls > 0:
+            writer.add_scalar("CFRDebug/branch_tail_per_call", tail_samples / branch_calls, iteration)
+        if "branch_selected_max" in stats:
+            writer.add_scalar("CFRDebug/branch_selected_max", stats["branch_selected_max"], iteration)
+        if "branch_legal_max" in stats:
+            writer.add_scalar("CFRDebug/branch_legal_max", stats["branch_legal_max"], iteration)
+        hits = stats.get("subset_cache_hits", 0.0)
+        misses = stats.get("subset_cache_misses", 0.0)
+        cache_total = hits + misses
+        if cache_total > 0:
+            writer.add_scalar("CFRDebug/subset_cache_hit_rate", hits / cache_total, iteration)
+        writer.add_scalar("CFRDebug/subset_cache_hits", hits, iteration)
+        writer.add_scalar("CFRDebug/subset_cache_misses", misses, iteration)
+        util_count = stats.get("utility_count", 0.0)
+        if util_count > 0:
+            util_sum = stats.get("utility_sum", 0.0)
+            util_sumsq = stats.get("utility_sumsq", 0.0)
+            mean = util_sum / util_count
+            variance = max(util_sumsq / util_count - mean * mean, 0.0)
+            writer.add_scalar("CFRDebug/traversal_util_mean", mean, iteration)
+            writer.add_scalar("CFRDebug/traversal_util_var", variance, iteration)
+            writer.add_scalar("CFRDebug/traversal_util_std", variance ** 0.5, iteration)
+        seat0_count = stats.get("utility_count_seat0", 0.0)
+        if seat0_count > 0:
+            seat0_sum = stats.get("utility_sum_seat0", 0.0)
+            seat0_sumsq = stats.get("utility_sumsq_seat0", 0.0)
+            seat0_mean = seat0_sum / seat0_count
+            seat0_var = max(seat0_sumsq / seat0_count - seat0_mean * seat0_mean, 0.0)
+            writer.add_scalar("CFRDebug/traversal_util_mean_seat0", seat0_mean, iteration)
+            writer.add_scalar("CFRDebug/traversal_util_std_seat0", seat0_var ** 0.5, iteration)
+        mccfr_calls = stats.get("mccfr_calls", 0.0)
+        if mccfr_calls > 0:
+            depth_total = stats.get("mccfr_depth_total", 0.0)
+            writer.add_scalar("CFRDebug/mccfr_calls", mccfr_calls, iteration)
+            writer.add_scalar("CFRDebug/mccfr_avg_depth", depth_total / mccfr_calls, iteration)
+        writer.add_scalar("CFRDebug/mccfr_rollout_calls", stats.get("mccfr_rollout_calls", 0.0), iteration)
+        writer.add_scalar("CFRDebug/mccfr_terminal", stats.get("mccfr_terminal", 0.0), iteration)
+        if "mccfr_max_depth" in stats:
+            writer.add_scalar("CFRDebug/mccfr_max_depth", stats["mccfr_max_depth"], iteration)
     def _get_strategy(self, infoset_key, legal_mask: np.ndarray) -> np.ndarray:
         """Fetch/init tables for the given infoset and compute policy."""
         if infoset_key not in self.cum_regret:
@@ -494,7 +576,9 @@ class CFRTrainer:
         cached = self._subset_cache.get(key_bytes)
         if cached is not None:
             self._subset_cache.move_to_end(key_bytes)
+            self._stat_add("subset_cache_hits", 1.0)
             return cached
+        self._stat_add("subset_cache_misses", 1.0)
         dp_has, dp_mask = _subset_sum_dp_numpy(table)
         self._subset_cache[key_bytes] = (dp_has, dp_mask)
         if len(self._subset_cache) > self._subset_cache_cap:
@@ -562,11 +646,20 @@ class CFRTrainer:
     
     def _select_branch_actions(self, infoset_key: Tuple[int, bytes], legal_actions: np.ndarray, sigma: np.ndarray, visit_count: int) -> np.ndarray:
         actions = legal_actions
-        if actions.size == 0:
+        legal_count = int(actions.size)
+        self._stat_add("branch_calls", 1.0)
+        self._stat_add("branch_legal_total", float(legal_count))
+        self._stat_record_max("branch_legal_max", float(legal_count))
+        if legal_count == 0:
             return actions
+        before_prune = actions.size
         pruned = self._apply_regret_pruning(infoset_key, actions, visit_count)
         if pruned.size > 0:
+            removed = max(before_prune - pruned.size, 0)
+            if removed > 0:
+                self._stat_add("branch_pruned_actions", float(removed))
             actions = pruned
+        self._stat_add("branch_post_prune_total", float(actions.size))
         effective_limit = self.branch_topk
         if effective_limit is None and self.max_branch_actions is not None:
             effective_limit = self.max_branch_actions
@@ -591,7 +684,9 @@ class CFRTrainer:
                     samples = min(tail_actions.size, max(self.pw_tail, 1) + int(np.log1p(visit_count)))
                     sampled = self._sample_weighted_subset(tail_actions, probs_masked[tail_mask], samples)
                     if sampled.size > 0:
+                        self._stat_add("branch_tail_samples", float(sampled.size))
                         selected = np.concatenate([selected, sampled.astype(selected.dtype)])
+        self._stat_add("branch_width_cap_total", float(width_cap))
         selected = np.unique(selected.astype(np.int32))
         if width_cap < selected.size:
             downsampled = self._sample_weighted_subset(selected, sigma[selected], width_cap)
@@ -599,13 +694,15 @@ class CFRTrainer:
                 selected = downsampled.astype(np.int32)
             else:
                 selected = selected[:width_cap]
-        
+
         if self.max_branch_actions is not None and selected.size > self.max_branch_actions:
             downsampled = self._sample_weighted_subset(selected, sigma[selected], self.max_branch_actions)
             if downsampled.size > 0:
                 selected = downsampled.astype(np.int32)
             else:
                 selected = selected[:self.max_branch_actions]
+        self._stat_add("branch_selected_total", float(selected.size))
+        self._stat_record_max("branch_selected_max", float(selected.size))
         return np.sort(selected.astype(np.int32))
 
     def _apply_action_inplace(self, st: NState, action_idx: int, subset_mask: Optional[np.ndarray] = None) -> ActionDiff:
@@ -772,13 +869,18 @@ class CFRTrainer:
                sample_reach: float = 1.0,
                depth: int = 0) -> float:
         """Recursive MCCFR traversal optimizing `target_seat` with importance weighting."""
+        self._stat_add("mccfr_calls", 1.0)
+        self._stat_add("mccfr_depth_total", float(depth))
+        self._stat_record_max("mccfr_max_depth", float(depth))
         if np_is_terminal(st):
+            self._stat_add("mccfr_terminal", 1.0)
             payoff = self._evaluate_utility(st, target_seat)
             if sample_reach <= 0.0:
                 return payoff
             return float(reach_others / sample_reach) * payoff
 
         if self.rollout_depth is not None and depth >= self.rollout_depth:
+            self._stat_add("mccfr_rollout_calls", 1.0)
             return self._estimate_rollout_value(st, target_seat, self.rng)
 
         cur_seat = int(st.cur_player)
@@ -861,18 +963,80 @@ class CFRTrainer:
         self._undo_action(st, diff)
         return value
 
+    def dump_top_infosets(self, iteration: int, top_k: int, path: str, mode: str = "max_regret") -> None:
+        """Persist the most problematic infosets for offline inspection."""
+        if top_k is None or top_k <= 0:
+            return
+        entries = []
+        for (seat, key), regrets in self.cum_regret.items():
+            arr = np.asarray(regrets, dtype=np.float64)
+            abs_arr = np.abs(arr)
+            max_reg = float(abs_arr.max()) if abs_arr.size > 0 else 0.0
+            mean_reg = float(abs_arr.mean()) if abs_arr.size > 0 else 0.0
+            visits = int(self._infoset_visits.get((seat, key), 0))
+            strat_sum = self.cum_strategy.get((seat, key))
+            entropy = None
+            top_actions = []
+            if strat_sum is not None:
+                strat = np.asarray(strat_sum, dtype=np.float64)
+                total = float(strat.sum())
+                probs = strat / total if total > 0 else np.zeros_like(strat)
+                entropy = float(-np.sum(np.where(probs > 1e-12, probs * np.log2(np.clip(probs, 1e-12, 1.0)), 0.0)))
+                top_idx = np.argsort(probs)[-5:][::-1]
+                top_actions = [
+                    {
+                        "action": int(idx),
+                        "prob": float(probs[idx]),
+                        "regret": float(arr[idx]),
+                    }
+                    for idx in top_idx
+                    if probs[idx] > 1e-6
+                ]
+            entries.append(
+                {
+                    "seat": int(seat),
+                    "infoset_key": key.hex(),
+                    "max_regret": max_reg,
+                    "mean_abs_regret": mean_reg,
+                    "visits": visits,
+                    "strategy_entropy": entropy,
+                    "top_actions": top_actions,
+                }
+            )
+        if not entries:
+            return
+        sort_key = "mean_abs_regret" if mode == "mean_abs_regret" else "max_regret"
+        entries.sort(key=lambda item: item[sort_key], reverse=True)
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        payload = {
+            "iteration": int(iteration),
+            "mode": sort_key,
+            "top_k": int(top_k),
+            "entries": entries[:top_k],
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+
     def _metrics_snapshot(self) -> Dict[str, float]:
         n_infosets = float(len(self.cum_regret))
         if n_infosets == 0:
             return {"num_infosets": 0.0, "avg_regret_abs": 0.0}
         total_abs = 0.0
+        total_sq = 0.0
         count = 0
+        max_abs = 0.0
         for arr in self.cum_regret.values():
             a = np.asarray(arr)
-            total_abs += np.abs(a).sum()
+            abs_arr = np.abs(a)
+            total_abs += abs_arr.sum()
+            total_sq += np.square(a).sum()
             count += a.size
+            local_max = float(abs_arr.max()) if abs_arr.size > 0 else 0.0
+            if local_max > max_abs:
+                max_abs = local_max
         avg_abs = float(total_abs / max(count, 1))
-        return {"num_infosets": n_infosets, "avg_regret_abs": avg_abs}
+        rms = float(np.sqrt(total_sq / max(count, 1))) if count > 0 else 0.0
+        return {"num_infosets": n_infosets, "avg_regret_abs": avg_abs, "regret_rms": rms, "max_regret_abs": max_abs}
 
     def _log_metrics(self, it: int, util0: Optional[float] = None):
         if self.tlogger is None:
@@ -880,6 +1044,8 @@ class CFRTrainer:
         snap = self._metrics_snapshot()
         self.tlogger.writer.add_scalar("CFR/num_infosets", snap["num_infosets"], it)
         self.tlogger.writer.add_scalar("CFR/avg_regret_abs", snap["avg_regret_abs"], it)
+        self.tlogger.writer.add_scalar("CFR/regret_rms", snap["regret_rms"], it)
+        self.tlogger.writer.add_scalar("CFR/regret_max_abs", snap["max_regret_abs"], it)
         if util0 is not None:
             self.tlogger.writer.add_scalar("CFR/util_seat0", float(util0), it)
 
@@ -1350,7 +1516,7 @@ class CFRTrainer:
             best_save_path: Optional[str] = None, best_save_kind: Optional[str] = None,
             branch_topk_decay: float = 1.0, branch_topk_min: Optional[int] = None,
             exploit_every: Optional[int] = None, exploit_episodes: Optional[int] = None,
-            exploit_use_avg_policy: bool = True):
+            exploit_use_avg_policy: bool = True, debug_topk: Optional[int] = None, debug_dir: Optional[str] = None):
         """Run MCCFR for a given number of iterations with mini-batching.
 
         Each iteration samples B independent deals and accumulates regrets/strategy.
@@ -1374,7 +1540,19 @@ class CFRTrainer:
             else None
         )
 
+        debug_topk = int(debug_topk) if (debug_topk is not None and int(debug_topk) > 0) else None
+        debug_dump_dir = None
+        if debug_topk:
+            if debug_dir:
+                debug_dump_dir = debug_dir
+            elif self.tlogger is not None:
+                debug_dump_dir = os.path.join(self.tlogger.get_log_dir(), "debug")
+            else:
+                debug_dump_dir = os.path.join(os.getcwd(), "cfr_debug")
+            os.makedirs(debug_dump_dir, exist_ok=True)
+
         for it in trange(1, iterations + 1, desc="Iter"):
+            self._begin_iteration_stats()
             t0 = time.time()
             if self.branch_topk is not None:
                 min_cap = branch_topk_min if branch_topk_min is not None else 1
@@ -1403,7 +1581,13 @@ class CFRTrainer:
                     targets = [int(self.rng.integers(0, 4)) for _ in range(trav_per_deal)]
                 for target in targets:
                     util = self._mccfr(st, target)
+                    self._stat_add("utility_count", 1.0)
+                    self._stat_add("utility_sum", float(util))
+                    self._stat_add("utility_sumsq", float(util * util))
                     if target == 0:
+                        self._stat_add("utility_count_seat0", 1.0)
+                        self._stat_add("utility_sum_seat0", float(util))
+                        self._stat_add("utility_sumsq_seat0", float(util * util))
                         util0_acc += util
                     seat0_visits += 1
 
@@ -1414,12 +1598,18 @@ class CFRTrainer:
                 else:
                     print(f"Iter {it}: util seat0 not sampled this iteration")
 
-            if self.tlogger is not None and it % max(log_every, 1) == 0:
+            should_emit = self.tlogger is not None and it % max(log_every, 1) == 0
+            if should_emit:
                 self._log_metrics(it, util0=util0_acc / float(B))
                 self._log_metrics(it, util0=util0_avg)
                 if seat0_visits > 0:
                     self.tlogger.writer.add_scalar("CFR/seat0_traversals", float(seat0_visits), it)
+                if debug_topk:
+                    dump_path = os.path.join(debug_dump_dir, f"infosets_{it:06d}.json") if debug_dump_dir else None
+                    if dump_path is not None:
+                        self.dump_top_infosets(it, debug_topk, dump_path)
 
+            self._finalize_iteration_stats(it, emit=should_emit)
 
             self._perform_evaluations(
                 iteration=it,

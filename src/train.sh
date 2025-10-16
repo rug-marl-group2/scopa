@@ -28,6 +28,6 @@ fi
 if [ "$ALGO" = "ctde" ]; then
     srun python scopa/src/train_ctde.py --eval_vs_random "$@"
 else
-    srun python scopa/src/train_cfr.py --iters 800 --log_every 5 --eval_every 25 --eval_eps 32 --eval_policy avg --save_kind full --max_infosets 400000 --batch_size 16 "$@"
+    srun python scopa/src/train_cfr.py --iters 800 --log_every 5 --eval_every 25 --reward selfish "$@"
 fi
 
