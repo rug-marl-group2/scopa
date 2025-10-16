@@ -3,12 +3,12 @@ from dataclasses import dataclass
 from collections import OrderedDict, defaultdict
 import os
 import pickle
+import time
 
 import numpy as np
 from numpy.random import Generator, PCG64
 from tqdm import trange
 import hashlib
-import jax
 
 
 # --------------------------
@@ -22,7 +22,6 @@ NUM_CARDS = NUM_SUITS * NUM_RANKS
 # Index metadata
 CARD_RANKS = np.concatenate([np.arange(1, NUM_RANKS + 1, dtype=np.int32) for _ in range(NUM_SUITS)])
 CARD_SUITS = np.concatenate([np.full((NUM_RANKS,), si, dtype=np.int32) for si in range(NUM_SUITS)])
-
 TEAM0_MASK = np.array([1, 0, 1, 0], dtype=np.int32)
 TEAM1_MASK = np.array([0, 1, 0, 1], dtype=np.int32)
 TEAM_INDEX = np.array([0, 1, 0, 1], dtype=np.int32)
@@ -84,23 +83,39 @@ def np_build_obs(st: NState, seat: int) -> np.ndarray:
     return out
 
 
-def _subset_sum_mask(table: np.ndarray, target_rank: int) -> np.ndarray:
-    dp_has = np.zeros(NUM_RANKS + 1, dtype=bool)
+
+_EMPTY_DP_HAS = np.zeros((NUM_RANKS + 1,), dtype=bool)
+_EMPTY_DP_HAS[0] = True
+_EMPTY_DP_MASK = np.zeros((NUM_RANKS + 1, NUM_CARDS), dtype=bool)
+
+
+def _subset_sum_dp_numpy(table: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    if table.sum() <= 0:
+        return _EMPTY_DP_HAS.copy(), _EMPTY_DP_MASK.copy()
+    dp_has = np.zeros((NUM_RANKS + 1,), dtype=bool)
     dp_has[0] = True
     dp_mask = np.zeros((NUM_RANKS + 1, NUM_CARDS), dtype=bool)
-    # Iterate cards present on table
-    for i in range(NUM_CARDS):
-        if table[i] != 1:
+    table_indices = np.nonzero(table)[0]
+    for idx in table_indices:
+        rank = int(CARD_RANKS[idx])
+        if rank <= 0 or rank > NUM_RANKS:
             continue
-        r = int(CARD_RANKS[i])
-        for s in range(NUM_RANKS, r - 1, -1):
-            if not dp_has[s] and dp_has[s - r]:
+        for s in range(NUM_RANKS, rank - 1, -1):
+            if (not dp_has[s]) and dp_has[s - rank]:
                 dp_has[s] = True
-                dp_mask[s] = dp_mask[s - r].copy()
-                dp_mask[s][i] = True
-    if dp_has[target_rank]:
-        return dp_mask[target_rank]
-    return np.zeros((NUM_CARDS,), dtype=bool)
+                row = dp_mask[s - rank].copy()
+                row[idx] = True
+                dp_mask[s] = row
+    return dp_has, dp_mask
+
+
+def _subset_sum_mask(table: np.ndarray, target_rank: int) -> np.ndarray:
+    if target_rank <= 0 or target_rank > NUM_RANKS:
+        return np.zeros((NUM_CARDS,), dtype=bool)
+    dp_has, dp_mask = _subset_sum_dp_numpy(table)
+    if target_rank >= dp_has.size or not bool(dp_has[target_rank]):
+        return np.zeros((NUM_CARDS,), dtype=bool)
+    return np.asarray(dp_mask[target_rank], dtype=bool).copy()
 
 
 def np_step(st: NState, action_idx: int) -> tuple[NState, bool]:
@@ -276,7 +291,7 @@ class CFRTrainer:
         self.prune_warmup = max(int(prune_warmup), 0)
         self.prune_reactivation = max(int(prune_reactivation), 1)
         self._infoset_visits: Dict[Tuple[int, bytes], int] = {}
-        self._subset_cache: OrderedDict[Tuple[int, bytes], np.ndarray] = OrderedDict()
+        self._subset_cache: OrderedDict[bytes, Tuple[np.ndarray, np.ndarray]] = OrderedDict()
         self._subset_cache_cap = max(int(subset_cache_size), 0)
         mba = int(max_branch_actions) if (max_branch_actions and max_branch_actions > 0) else None
         if mba is not None and self.branch_topk is not None:
@@ -347,22 +362,42 @@ class CFRTrainer:
             return legal
         return legal / total
     
-    def _subset_sum_mask_cached(self, table: np.ndarray, target_rank: int) -> np.ndarray:
-        if target_rank <= 0:
-            return np.zeros((NUM_CARDS,), dtype=bool)
+
+    def _get_subset_dp(self, table: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         if self._subset_cache_cap <= 0 or table.sum() <= 0:
-            return _subset_sum_mask(table, target_rank)
+            return _subset_sum_dp_numpy(table)
         key_bytes = np.packbits(table.astype(np.uint8), bitorder="little").tobytes()
-        cache_key = (target_rank, key_bytes)
-        cached = self._subset_cache.get(cache_key)
+        cached = self._subset_cache.get(key_bytes)
         if cached is not None:
-            self._subset_cache.move_to_end(cache_key)
-            return cached.copy()
-        mask = _subset_sum_mask(table, target_rank)
-        self._subset_cache[cache_key] = mask.copy()
+            self._subset_cache.move_to_end(key_bytes)
+            return cached
+        dp_has, dp_mask = _subset_sum_dp_numpy(table)
+        self._subset_cache[key_bytes] = (dp_has, dp_mask)
         if len(self._subset_cache) > self._subset_cache_cap:
             self._subset_cache.popitem(last=False)
-        return mask
+        return dp_has, dp_mask
+
+    def _subset_sum_mask_cached(self, table: np.ndarray, target_rank: int) -> np.ndarray:
+        if target_rank <= 0 or target_rank > NUM_RANKS:
+            return np.zeros((NUM_CARDS,), dtype=bool)
+        dp_has, dp_mask = self._get_subset_dp(table)
+        if target_rank >= dp_has.size or not bool(dp_has[target_rank]):
+            return np.zeros((NUM_CARDS,), dtype=bool)
+        return np.asarray(dp_mask[target_rank], dtype=bool).copy()
+
+    def _subset_sum_masks_cached(self, table: np.ndarray, actions: np.ndarray) -> Dict[int, np.ndarray]:
+        if actions.size == 0:
+            return {}
+        dp_has, dp_mask = self._get_subset_dp(table)
+        cache: Dict[int, np.ndarray] = {}
+        for a in actions:
+            idx = int(a)
+            rank = int(CARD_RANKS[idx])
+            if rank <= 0 or rank > NUM_RANKS:
+                continue
+            if bool(dp_has[rank]):
+                cache[idx] = dp_mask[rank]
+        return cache
 
     def _increment_visit(self, infoset_key: Tuple[int, bytes]) -> int:
         count = self._infoset_visits.get(infoset_key, 0) + 1
@@ -380,27 +415,6 @@ class CFRTrainer:
             return actions[keep_mask]
         return actions
 
-    def _sample_weighted_subset(self, choices: np.ndarray, weights: np.ndarray, k: int) -> np.ndarray:
-        if choices.size == 0 or k <= 0:
-            return np.empty((0,), dtype=choices.dtype)
-        probs = np.clip(np.asarray(weights, dtype=np.float64), 0.0, None)
-        total = float(probs.sum())
-        if total <= 0.0 or not np.isfinite(total):
-            probs = np.full(choices.size, 1.0 / float(choices.size), dtype=np.float64)
-        else:
-            probs /= total
-            adjust = 1.0 - float(probs.sum())
-            if abs(adjust) > 1e-15:
-                probs[-1] += adjust
-            probs = np.clip(probs, 0.0, 1.0)
-            norm = float(probs.sum())
-            if norm <= 0.0 or not np.isfinite(norm):
-                probs = np.full(choices.size, 1.0 / float(choices.size), dtype=np.float64)
-            else:
-                probs /= norm
-        idx = self.rng.choice(choices.size, size=min(k, choices.size), replace=False, p=probs)
-        return choices[np.atleast_1d(idx)]
-    
     def _sample_weighted_subset(self, choices: np.ndarray, weights: np.ndarray, k: int) -> np.ndarray:
         if choices.size == 0 or k <= 0:
             return np.empty((0,), dtype=choices.dtype)
@@ -470,7 +484,7 @@ class CFRTrainer:
                 selected = selected[:self.max_branch_actions]
         return np.sort(selected.astype(np.int32))
 
-    def _apply_action_inplace(self, st: NState, action_idx: int) -> ActionDiff:
+    def _apply_action_inplace(self, st: NState, action_idx: int, subset_mask: Optional[np.ndarray] = None) -> ActionDiff:
         seat = int(st.cur_player)
         diff = ActionDiff(
             seat=seat,
@@ -504,13 +518,17 @@ class CFRTrainer:
                 st.captures[seat, cap_idx] += 1
             st.last_capture_player = np.int32(seat)
         else:
-            subset_mask = self._subset_sum_mask_cached(st.table, rank)
-            if subset_mask.any():
-                table_indices = np.nonzero(subset_mask)[0]
+            mask = subset_mask
+            if mask is None:
+                mask = self._subset_sum_mask_cached(st.table, rank)
+            else:
+                mask = np.asarray(mask, dtype=bool)
+            if mask.any():
+                table_indices = np.nonzero(mask)[0]
                 diff.table_indices = table_indices
                 diff.table_prev = st.table[table_indices].copy()
                 st.table[table_indices] = 0
-                captured = subset_mask.astype(np.int8)
+                captured = mask.astype(np.int8)
                 captured[action_idx] = 1
                 cap_idx = np.nonzero(captured)[0]
                 if cap_idx.size > 0:
@@ -696,6 +714,7 @@ class CFRTrainer:
         visit_count = self._increment_visit(infoset_key)
 
         legal_actions = np.nonzero(legal_mask)[0]
+        subset_masks = self._subset_sum_masks_cached(st.table, legal_actions)
         if cur_seat == target_seat:
             action_values = np.zeros(NUM_CARDS, dtype=np.float32)
             util_acc = 0.0
@@ -707,7 +726,7 @@ class CFRTrainer:
             for a in branch_actions:
                 a_int = int(a)
                 prob = float(max(sigma[a_int], 0.0))
-                diff = self._apply_action_inplace(st, a_int)
+                diff = self._apply_action_inplace(st, a_int, subset_mask=subset_masks.get(a_int))
                 v = self._mccfr(
                     st,
                     target_seat,
@@ -755,7 +774,7 @@ class CFRTrainer:
         if sample_prob <= 0.0:
             sample_prob = 1.0 / max(legal_actions.size, 1)
 
-        diff = self._apply_action_inplace(st, int(action))
+        diff = self._apply_action_inplace(st, int(action), subset_mask=subset_masks.get(int(action)))
         value = self._mccfr(
             st,
             target_seat,
@@ -932,7 +951,7 @@ class CFRTrainer:
         # Category sums (auto-extend to new metrics)
         sums = defaultdict(float)
 
-        for ep in range(episodes):
+        for ep in trange(episodes, desc="eval"):
             st = np_init_state(Generator(PCG64(seed + 1000 + ep)))
             while not np_is_terminal(st):
                 seat = int(st.cur_player)
@@ -967,16 +986,148 @@ class CFRTrainer:
         return out
 
     
+    # --------------------------
+    # Exploitability utilities
+    # --------------------------
+    def _policy_action_probs(self, seat: int, obs: np.ndarray,
+                             policy_map: Optional[Dict[Tuple[int, bytes], np.ndarray]],
+                             use_avg_policy: bool) -> np.ndarray:
+        """Return a probability distribution over legal actions for an infoset."""
+        legal = (obs[0] > 0).astype(np.float32)
+        key = (seat, self._obs_key(obs))
+
+        probs = None
+        if policy_map is not None:
+            probs = policy_map.get(key)
+
+        if probs is None and use_avg_policy:
+            strat_sum = self.cum_strategy.get(key)
+            if strat_sum is not None:
+                strat = np.asarray(strat_sum, dtype=np.float32)
+                total = float(strat.sum())
+                if total > 0.0 and np.isfinite(total):
+                    probs = strat / total
+
+        if probs is None:
+            probs = self._peek_strategy(key, legal.astype(np.int32))
+
+        probs = np.asarray(probs, dtype=np.float32) * legal
+        total = float(probs.sum())
+        if total > 0.0 and np.isfinite(total):
+            probs /= total
+        else:
+            count = max(int(legal.sum()), 1)
+            probs = legal / float(count)
+        return probs
+
+    def _policy_value_recursive(self, st: NState,
+                                target_team: Optional[int],
+                                policy_map: Optional[Dict[Tuple[int, bytes], np.ndarray]],
+                                use_avg_policy: bool,
+                                depth: int = 0) -> float:
+        """Return expected seat-0 utility under the supplied policy, optionally allowing a team BR."""
+        if np_is_terminal(st):
+            return float(self._evaluate_utility(st, seat=0))
+
+        if self.rollout_depth is not None and depth >= self.rollout_depth:
+            # Use rollout to approximate remaining value.
+            return float(self._estimate_rollout_value(st, target_seat=0, rng=self.rng))
+
+        seat = int(st.cur_player)
+        team = int(TEAM_INDEX[seat])
+        obs = np_build_obs(st, seat)
+        legal_mask = (obs[0] > 0).astype(np.int32)
+        legal_actions = np.nonzero(legal_mask)[0]
+        subset_masks = self._subset_sum_masks_cached(st.table, legal_actions)
+        if legal_actions.size == 0:
+            return float(self._policy_value_recursive(st, target_team, policy_map, use_avg_policy, depth + 1))
+
+        if target_team is not None and team == target_team:
+            if target_team == 0:
+                best_val = float('-inf')
+                for a in legal_actions:
+                    diff = self._apply_action_inplace(st, int(a), subset_mask=subset_masks.get(int(a)))
+                    val = self._policy_value_recursive(st, target_team, policy_map, use_avg_policy, depth + 1)
+                    self._undo_action(st, diff)
+                    if val > best_val:
+                        best_val = val
+                if not np.isfinite(best_val):
+                    best_val = 0.0
+                return float(best_val)
+            else:
+                worst_val = float('inf')
+                for a in legal_actions:
+                    diff = self._apply_action_inplace(st, int(a), subset_mask=subset_masks.get(int(a)))
+                    val = self._policy_value_recursive(st, target_team, policy_map, use_avg_policy, depth + 1)
+                    self._undo_action(st, diff)
+                    if val < worst_val:
+                        worst_val = val
+                if not np.isfinite(worst_val):
+                    worst_val = 0.0
+                return float(worst_val)
+
+        probs = self._policy_action_probs(seat, obs, policy_map, use_avg_policy)
+        total = 0.0
+        for a in legal_actions:
+            prob = float(probs[int(a)])
+            if prob <= 0.0:
+                continue
+            diff = self._apply_action_inplace(st, int(a), subset_mask=subset_masks.get(int(a)))
+            val = self._policy_value_recursive(st, target_team, policy_map, use_avg_policy, depth + 1)
+            self._undo_action(st, diff)
+            total += prob * float(val)
+        return float(total)
+
+    def compute_exploitability(self, episodes: int = 8, seed: int = 12345,
+                               use_avg_policy: bool = True) -> Dict[str, float]:
+        """Estimate exploitability by sampling deals and computing team best responses."""
+        if episodes <= 0:
+            raise ValueError("episodes must be positive for exploitability computation")
+
+        policy_map = self.get_average_policy() if use_avg_policy else None
+        total_value = 0.0
+        total_br0 = 0.0
+        total_br1 = 0.0
+
+        for ep in trange(episodes, desc='Exploitability'):
+            deal_rng = Generator(PCG64(seed + 1000 + ep))
+            st = np_init_state(deal_rng)
+            base_val = self._policy_value_recursive(st, None, policy_map, use_avg_policy)
+            br0_val = self._policy_value_recursive(st, 0, policy_map, use_avg_policy)
+            br1_val = self._policy_value_recursive(st, 1, policy_map, use_avg_policy)
+            total_value += float(base_val)
+            total_br0 += float(br0_val)
+            total_br1 += float(br1_val)
+
+        inv_eps = 1.0 / float(episodes)
+        avg_value = total_value * inv_eps
+        avg_br0 = total_br0 * inv_eps
+        avg_br1 = total_br1 * inv_eps
+        gain0 = max(0.0, avg_br0 - avg_value)
+        gain1 = max(0.0, avg_value - avg_br1)
+        exploit = 0.5 * (gain0 + gain1)
+        return {
+            'exploitability': float(exploit),
+            'policy_value': float(avg_value),
+            'best_response_team0': float(avg_br0),
+            'best_response_team1': float(avg_br1),
+            'gain_team0': float(gain0),
+            'gain_team1': float(gain1),
+        }
+
     def train(self, iterations: int = 1000, seed: int = 42, verbose: bool = False, log_every: int = 100,
             eval_every: Optional[int] = None, eval_episodes: int = 32, eval_use_avg_policy: bool = True,
             batch_size: Optional[int] = None, traversals_per_deal: Optional[int] = 1,
             best_save_path: Optional[str] = None, best_save_kind: Optional[str] = None,
-            branch_topk_decay: float = 1.0, branch_topk_min: Optional[int] = None):
+            branch_topk_decay: float = 1.0, branch_topk_min: Optional[int] = None,
+            exploit_every: Optional[int] = None, exploit_episodes: Optional[int] = None,
+            exploit_use_avg_policy: bool = True):
         """Run MCCFR for a given number of iterations with mini-batching.
 
         Each iteration samples B independent deals and accumulates regrets/strategy.
         """
         for it in trange(1, iterations + 1, desc="Iter"):
+            t0 = time.time()
             if self.branch_topk is not None:
                 min_cap = branch_topk_min if branch_topk_min is not None else 1
                 if min_cap <= 0:
@@ -1046,6 +1197,27 @@ class CFRTrainer:
                         except Exception as exc:
                             print(f"[CFR] WARNING: failed to save best checkpoint to {best_save_path}: {exc}")
 
+            do_exploit = (exploit_every is not None and exploit_every > 0 and (it % exploit_every == 0))
+            if do_exploit:
+                exploit_eps = exploit_episodes if (exploit_episodes is not None and exploit_episodes > 0) else eval_episodes
+                try:
+                    exploit_stats = self.compute_exploitability(
+                        episodes=exploit_eps,
+                        seed=seed + 9999 + it,
+                        use_avg_policy=exploit_use_avg_policy
+                    )
+                except Exception as exc:
+                    if verbose:
+                        print(f"[CFR] WARNING: exploitability computation failed at iter {it}: {exc}")
+                else:
+                    if self.tlogger is not None:
+                        for key, val in exploit_stats.items():
+                            self.tlogger.writer.add_scalar(f"Exploitability/{key}", float(val), it)
+                    if verbose:
+                        print(f"[CFR] Iter {it}: exploitability {exploit_stats['exploitability']:.4f}")
+            t1 = time.time()
+            if self.tlogger is not None:
+                self.tlogger.writer.add_scalar("dt", t1-t0, it)
     def get_average_policy(self) -> Dict[Tuple[int, bytes], np.ndarray]:
         policy = {}
         for k, strat_sum in self.cum_strategy.items():

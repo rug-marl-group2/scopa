@@ -1,9 +1,9 @@
 #!/bin/bash
 #SBATCH --mem=32GB
 #SBATCH --time=20:55:55
-#SBATCH --job-name=vcfrsup
+#SBATCH --job-name=acfrlesssup
 #SBATCH --partition=gpu
-#SBATCH --gres=gpu:v100:1
+#SBATCH --gres=gpu:a100:1
 #SBATCH --nodes=1
 #SBATCH --output=scopa/logs/output.%j.log  # Output log
 #SBATCH --error=scopa/logs/error.%j.log   # Error log

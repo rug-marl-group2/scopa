@@ -4,7 +4,7 @@ using a JAX-based implementation. It logs training metrics, optionally evaluates
 the resulting policy, and previews gameplay using both random and learned strategies.        
 
 Example Usage:
-    python scopa/src/train_cfr.py --iters 2500 --log_every 10 --eval_every 100 --eval_eps 64 --eval_policy current --save_kind current --branch_topk 1 --max_infosets 250000
+    python scopa/src/train_cfr.py --iters 10 --log_every 1 --exploit_every 2 --exploit_eps 16 --exploit_policy avg --eval_every 4 --eval_eps 64 --eval_policy current --save_kind full --max_infosets 250000
 """
 
 
@@ -89,15 +89,15 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--iters", type=int, default=1000)
     parser.add_argument("--batch_size", type=int, default=4, help="Deals per iteration for MCCFR mini-batch")
-    parser.add_argument("--traversals_per_deal", type=int, default=3, help="Number of target seats sampled per deal (<=0 traverses all seats)")
+    parser.add_argument("--traversals_per_deal", type=int, default=1, help="Number of target seats sampled per deal (<=0 traverses all seats)")
     parser.add_argument("--rm_plus", action="store_true", default=True, help="Use RM+ (regret clamping)")
     parser.add_argument("--reward_mode", type=str, default="team", choices=["team", "selfish"], help="Select team-shared or selfish utility shaping")
     parser.add_argument("--seed", type=int, default=time.time_ns())
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--log_every", type=int, default=100)
-    parser.add_argument("--branch_topk", type=int, default=10, help="Initial top-K restriction during traversal; 0 disables pruning (full branching)")
+    parser.add_argument("--branch_topk", type=int, default=5, help="Initial top-K restriction during traversal; 0 disables pruning (full branching)")
     parser.add_argument("--branch_topk_decay", type=float, default=0, help="Multiplicative decay applied to branch_topk after each iteration")
-    parser.add_argument("--branch_topk_min", type=int, default=10, help="Lower bound for branch_topk during decay")
+    parser.add_argument("--branch_topk_min", type=int, default=5, help="Lower bound for branch_topk during decay")
     parser.add_argument("--max_branch_actions", type=int, default=0, help="Hard cap on traverser actions explored per infoset (0 = unlimited)")
     parser.add_argument("--pw_alpha", type=float, default=0.3, help="Progressive widening growth exponent")
     parser.add_argument("--pw_tail", type=int, default=3, help="Base number of tail actions sampled alongside top-K")
@@ -112,6 +112,9 @@ def main():
     parser.add_argument("--eval_every", type=int, default=100, help="Evaluate and log game metrics every N iters (0 to disable)")
     parser.add_argument("--eval_eps", type=int, default=64, help="Episodes per evaluation mode")
     parser.add_argument("--eval_policy", type=str, default="current", choices=["avg", "current"], help="Which policy to use for evaluation")
+    parser.add_argument("--exploit_every", type=int, default=0, help="Compute exploitability every N iterations (0 disables)")
+    parser.add_argument("--exploit_eps", type=int, default=8, help="Deals sampled when estimating exploitability")
+    parser.add_argument("--exploit_policy", type=str, default="avg", choices=["avg", "current"], help="Policy snapshot used for exploitability checks")
     parser.add_argument("--max_infosets", type=int, default=0, help="Cap the number of stored infosets (0 = unlimited)")
     parser.add_argument("--obs_key_mode", type=str, default="full", choices=["full", "compact", "hand_table"], help="How much of the observation to hash for infoset keys")
     parser.add_argument("--table_dtype", type=str, default="float16", choices=["float16", "float32"], help="Data type for regret/strategy tables to reduce memory")
@@ -159,7 +162,10 @@ def main():
         best_save_kind=args.save_kind,
         traversals_per_deal=args.traversals_per_deal,
         branch_topk_decay=args.branch_topk_decay,
-        branch_topk_min=args.branch_topk_min
+        branch_topk_min=args.branch_topk_min,
+        exploit_every=(args.exploit_every if args.exploit_every > 0 else None),
+        exploit_episodes=(args.exploit_eps if args.exploit_eps > 0 else None),
+        exploit_use_avg_policy=(args.exploit_policy == "avg")
     )
 
     # Save trained model/policy (default inside run dir)
