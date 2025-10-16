@@ -211,3 +211,4 @@ __marimo__/
 *runs*
 *.out
 *.bash
+*.pkl
