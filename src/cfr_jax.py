@@ -1,4 +1,4 @@
-from typing import Dict, Tuple, Optional, Union
+from typing import Dict, Tuple, Optional, Union, Callable
 from dataclasses import dataclass
 from collections import OrderedDict, defaultdict
 import os
@@ -54,6 +54,87 @@ class ActionDiff:
     scopa_delta: int
     last_capture_prev: int
     cur_player_prev: int
+
+
+def _apply_action_core(
+    st: NState,
+    action_idx: int,
+    subset_mask: Optional[np.ndarray] = None,
+    mask_resolver: Optional[Callable[[np.ndarray, int], np.ndarray]] = None,
+    record_diff: bool = False,
+) -> Tuple[Optional[ActionDiff], bool]:
+    """Shared Scopa action application used by env step and CFR traversal."""
+
+    seat = int(st.cur_player)
+    diff: Optional[ActionDiff] = None
+    if record_diff:
+        diff = ActionDiff(
+            seat=seat,
+            action_idx=int(action_idx),
+            hand_prev=int(st.hands[seat, action_idx]),
+            history_prev=int(st.history[seat, action_idx]),
+            table_indices=np.empty(0, dtype=np.int32),
+            table_prev=np.empty(0, dtype=np.int8),
+            captures_indices=np.empty(0, dtype=np.int32),
+            scopa_delta=0,
+            last_capture_prev=int(st.last_capture_player),
+            cur_player_prev=int(st.cur_player),
+        )
+
+    st.hands[seat, action_idx] = 0
+    st.history[seat, action_idx] = 1
+    rank = int(CARD_RANKS[action_idx])
+    scopa = False
+
+    if rank == 1:
+        table_indices = np.nonzero(st.table)[0]
+        if table_indices.size > 0:
+            if diff is not None:
+                diff.table_indices = table_indices
+                diff.table_prev = st.table[table_indices].copy()
+            st.table[table_indices] = 0
+        captured = np.zeros((NUM_CARDS,), dtype=np.int8)
+        if table_indices.size > 0:
+            captured[table_indices] = 1
+        captured[action_idx] = 1
+        cap_idx = np.nonzero(captured)[0]
+        if cap_idx.size > 0:
+            if diff is not None:
+                diff.captures_indices = cap_idx
+            st.captures[seat, cap_idx] += 1
+        st.last_capture_player = np.int32(seat)
+    else:
+        mask = subset_mask
+        if mask is None and mask_resolver is not None:
+            mask = mask_resolver(st.table, rank)
+        mask_bool = None if mask is None else np.asarray(mask, dtype=bool)
+        if mask_bool is not None and mask_bool.any():
+            table_indices = np.nonzero(mask_bool)[0]
+            if diff is not None:
+                diff.table_indices = table_indices
+                diff.table_prev = st.table[table_indices].copy()
+            st.table[table_indices] = 0
+            captured = mask_bool.astype(np.int8)
+            captured[action_idx] = 1
+            cap_idx = np.nonzero(captured)[0]
+            if cap_idx.size > 0:
+                if diff is not None:
+                    diff.captures_indices = cap_idx
+                st.captures[seat, cap_idx] += 1
+            scopa = bool(st.table.sum() == 0)
+            if scopa:
+                st.scopas[seat] += 1
+                if diff is not None:
+                    diff.scopa_delta = 1
+            st.last_capture_player = np.int32(seat)
+        else:
+            if diff is not None:
+                diff.table_indices = np.array([action_idx], dtype=np.int32)
+                diff.table_prev = np.array([st.table[action_idx]], dtype=np.int8)
+            st.table[action_idx] = 1
+
+    st.cur_player = np.int32((seat + 1) % 4)
+    return diff, scopa
 
 def np_init_state(rng: Generator) -> NState:
     st = NState()
@@ -119,37 +200,12 @@ def _subset_sum_mask(table: np.ndarray, target_rank: int) -> np.ndarray:
 
 
 def np_step(st: NState, action_idx: int) -> tuple[NState, bool]:
-    seat = int(st.cur_player)
-    # Remove from hand, mark history
-    st.hands[seat, action_idx] = 0
-    st.history[seat, action_idx] = 1
-    rank = int(CARD_RANKS[action_idx])
-
-    if rank == 1:
-        # Ace captures entire table + played card (no Scopa in env)
-        subset_mask = st.table.astype(bool)
-        captured = subset_mask.astype(np.int8)
-        captured[action_idx] = 1
-        st.captures[seat] += captured
-        st.table[:] = 0
-        st.last_capture_player = np.int32(seat)
-        scopa = False
-    else:
-        subset_mask = _subset_sum_mask(st.table, rank)
-        if subset_mask.any():
-            st.table[subset_mask] = 0
-            captured = subset_mask.astype(np.int8)
-            captured[action_idx] = 1
-            st.captures[seat] += captured
-            scopa = (st.table.sum() == 0)
-            if scopa:
-                st.scopas[seat] += 1
-            st.last_capture_player = np.int32(seat)
-        else:
-            st.table[action_idx] = 1
-            scopa = False
-
-    st.cur_player = np.int32((seat + 1) % 4)
+    _, scopa = _apply_action_core(
+        st,
+        int(action_idx),
+        mask_resolver=_subset_sum_mask,
+        record_diff=False,
+    )
     return st, scopa
 
 
@@ -485,65 +541,14 @@ class CFRTrainer:
         return np.sort(selected.astype(np.int32))
 
     def _apply_action_inplace(self, st: NState, action_idx: int, subset_mask: Optional[np.ndarray] = None) -> ActionDiff:
-        seat = int(st.cur_player)
-        diff = ActionDiff(
-            seat=seat,
-            action_idx=int(action_idx),
-            hand_prev=int(st.hands[seat, action_idx]),
-            history_prev=int(st.history[seat, action_idx]),
-            table_indices=np.empty(0, dtype=np.int32),
-            table_prev=np.empty(0, dtype=np.int8),
-            captures_indices=np.empty(0, dtype=np.int32),
-            scopa_delta=0,
-            last_capture_prev=int(st.last_capture_player),
-            cur_player_prev=int(st.cur_player),
+        diff, _ = _apply_action_core(
+            st,
+            int(action_idx),
+            subset_mask=subset_mask,
+            mask_resolver=self._subset_sum_mask_cached,
+            record_diff=True,
         )
-        st.hands[seat, action_idx] = 0
-        st.history[seat, action_idx] = 1
-        rank = int(CARD_RANKS[action_idx])
-
-        if rank == 1:
-            table_indices = np.nonzero(st.table)[0]
-            if table_indices.size > 0:
-                diff.table_indices = table_indices
-                diff.table_prev = st.table[table_indices].copy()
-                st.table[table_indices] = 0
-            captured = np.zeros((NUM_CARDS,), dtype=np.int8)
-            if table_indices.size > 0:
-                captured[table_indices] = 1
-            captured[action_idx] = 1
-            cap_idx = np.nonzero(captured)[0]
-            if cap_idx.size > 0:
-                diff.captures_indices = cap_idx
-                st.captures[seat, cap_idx] += 1
-            st.last_capture_player = np.int32(seat)
-        else:
-            mask = subset_mask
-            if mask is None:
-                mask = self._subset_sum_mask_cached(st.table, rank)
-            else:
-                mask = np.asarray(mask, dtype=bool)
-            if mask.any():
-                table_indices = np.nonzero(mask)[0]
-                diff.table_indices = table_indices
-                diff.table_prev = st.table[table_indices].copy()
-                st.table[table_indices] = 0
-                captured = mask.astype(np.int8)
-                captured[action_idx] = 1
-                cap_idx = np.nonzero(captured)[0]
-                if cap_idx.size > 0:
-                    diff.captures_indices = cap_idx
-                    st.captures[seat, cap_idx] += 1
-                if st.table.sum() == 0:
-                    st.scopas[seat] += 1
-                    diff.scopa_delta = 1
-                st.last_capture_player = np.int32(seat)
-            else:
-                diff.table_indices = np.array([action_idx], dtype=np.int32)
-                diff.table_prev = np.array([st.table[action_idx]], dtype=np.int8)
-                st.table[action_idx] = 1
-
-        st.cur_player = np.int32((seat + 1) % 4)
+        assert diff is not None  # for type checkers; record_diff=True guarantees diff
         return diff
 
     def _undo_action(self, st: NState, diff: ActionDiff) -> None:
@@ -636,7 +641,7 @@ class CFRTrainer:
                 sign = 1.0
             elif team_advantage < 0.0:
                 sign = -1.0
-            return sign if team_idx == 0 else -sign
+            return sign
 
         team_total = float(team_points[team_idx])
         if team_total > 0.0:
@@ -765,7 +770,8 @@ class CFRTrainer:
                     0.0
                 ).astype(self.accum_dtype)
 
-            strategy_weight = reach_my / max(sample_reach, 1e-12)
+            # Average strategy accumulates opponents' reach probability (pi_-i)
+            strategy_weight = reach_others / max(sample_reach, 1e-12)
             self.cum_strategy[infoset_key] += (sigma * strategy_weight).astype(self.accum_dtype)
             return util
 
@@ -775,11 +781,12 @@ class CFRTrainer:
             sample_prob = 1.0 / max(legal_actions.size, 1)
 
         diff = self._apply_action_inplace(st, int(action), subset_mask=subset_masks.get(int(action)))
+        actual_prob = float(max(sigma[int(action)], 0.0))
         value = self._mccfr(
             st,
             target_seat,
             reach_my=reach_my,
-            reach_others=reach_others * sample_prob,
+            reach_others=reach_others * actual_prob,
             sample_reach=sample_reach * sample_prob,
             depth=depth + 1,
         )
