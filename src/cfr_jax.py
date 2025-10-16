@@ -56,6 +56,59 @@ class ActionDiff:
     cur_player_prev: int
 
 
+@dataclass
+class EvaluationSchedule:
+    """Utility container that governs periodic evaluation runs."""
+
+    every: Optional[int]
+    episodes: int
+    use_avg_policy: bool
+
+    def is_enabled(self) -> bool:
+        return self.every is not None and self.every > 0 and self.episodes > 0
+
+    def should_run(self, iteration: int) -> bool:
+        return self.is_enabled() and iteration % int(self.every) == 0
+
+    def resolved_episodes(self) -> int:
+        return max(int(self.episodes), 1)
+
+
+@dataclass
+class ExploitabilitySchedule:
+    """Schedule controlling exploitability estimation frequency."""
+
+    every: Optional[int]
+    episodes: Optional[int]
+    use_avg_policy: bool
+
+    def is_enabled(self) -> bool:
+        return self.every is not None and self.every > 0
+
+    def should_run(self, iteration: int) -> bool:
+        return self.is_enabled() and iteration % int(self.every) == 0
+
+    def resolved_episodes(self, fallback: int) -> int:
+        eps = self.episodes if self.episodes is not None and self.episodes > 0 else fallback
+        return max(int(eps), 1)
+
+
+@dataclass
+class ExploitabilityConfig:
+    """Configuration for Monte Carlo exploitability estimation."""
+
+    policy_rollouts: int = 4
+    best_response_rollouts: int = 4
+    opponent_samples: int = 1
+
+    def sanitized(self) -> "ExploitabilityConfig":
+        return ExploitabilityConfig(
+            policy_rollouts=max(int(self.policy_rollouts), 1),
+            best_response_rollouts=max(int(self.best_response_rollouts), 1),
+            opponent_samples=max(int(self.opponent_samples), 1),
+        )
+
+
 def _apply_action_core(
     st: NState,
     action_idx: int,
@@ -144,6 +197,18 @@ def np_init_state(rng: Generator) -> NState:
         st.hands[seat, idx] = 1
     st.cur_player = np.int32(rng.integers(0, 4))
     return st
+
+
+def np_clone_state(st: NState) -> NState:
+    clone = NState()
+    clone.hands[...] = st.hands
+    clone.table[...] = st.table
+    clone.captures[...] = st.captures
+    clone.history[...] = st.history
+    clone.scopas[...] = st.scopas
+    clone.cur_player = np.int32(st.cur_player)
+    clone.last_capture_player = np.int32(st.last_capture_player)
+    return clone
 
 
 def np_legal_mask(st: NState) -> np.ndarray:
@@ -332,7 +397,8 @@ class CFRTrainer:
                  regret_prune: bool = True, prune_threshold: float = -0.05,
                  prune_warmup: int = 32, prune_reactivation: int = 8,
                  subset_cache_size: int = 8192, max_branch_actions: int = 0,
-                 rollout_depth: int = 0, rollout_samples: int = 0, reward_mode: str = "team"):
+                 rollout_depth: int = 0, rollout_samples: int = 0, reward_mode: str = "team",
+                 exploit_config: Optional[ExploitabilityConfig] = None):
         self.tlogger = tlogger
         self.rm_plus = bool(rm_plus)
         bt = branch_topk  # limit branching at traverser nodes for speed
@@ -361,6 +427,8 @@ class CFRTrainer:
         if mode not in ("team", "selfish"):
             raise ValueError(f"Unsupported reward_mode: {reward_mode}")
         self.reward_mode = mode
+        base_exploit_cfg = exploit_config.sanitized() if exploit_config is not None else ExploitabilityConfig()
+        self.exploit_config = base_exploit_cfg.sanitized()
 
         # Memory controls
         self.max_infosets = int(max_infosets) if (max_infosets is not None and max_infosets > 0) else None
@@ -1027,84 +1095,151 @@ class CFRTrainer:
             probs = legal / float(count)
         return probs
 
-    def _policy_value_recursive(self, st: NState,
-                                target_team: Optional[int],
-                                policy_map: Optional[Dict[Tuple[int, bytes], np.ndarray]],
-                                use_avg_policy: bool,
-                                depth: int = 0) -> float:
-        """Return expected seat-0 utility under the supplied policy, optionally allowing a team BR."""
+    def _simulate_policy_episode(self, st: NState,
+                                  policy_map: Optional[Dict[Tuple[int, bytes], np.ndarray]],
+                                  use_avg_policy: bool,
+                                  rng: Generator) -> float:
+        trace: list[ActionDiff] = []
+        while not np_is_terminal(st):
+            seat = int(st.cur_player)
+            obs = np_build_obs(st, seat)
+            legal_mask = (obs[0] > 0).astype(np.int32)
+            legal_actions = np.nonzero(legal_mask)[0]
+            if legal_actions.size == 0:
+                break
+            subset_masks = self._subset_sum_masks_cached(st.table, legal_actions)
+            probs = self._policy_action_probs(seat, obs, policy_map, use_avg_policy)
+            action = int(self._safe_sample(probs, legal_mask, rng))
+            diff = self._apply_action_inplace(st, action, subset_mask=subset_masks.get(action))
+            trace.append(diff)
+        payoff = float(self._evaluate_utility(st, seat=0))
+        while trace:
+            self._undo_action(st, trace.pop())
+        return payoff
+
+    def _estimate_policy_value_monte_carlo(self, st: NState,
+                                           policy_map: Optional[Dict[Tuple[int, bytes], np.ndarray]],
+                                           use_avg_policy: bool,
+                                           rng: Generator,
+                                           rollouts: int) -> float:
+        total = 0.0
+        runs = max(int(rollouts), 1)
+        for _ in range(runs):
+            total += self._simulate_policy_episode(st, policy_map, use_avg_policy, rng)
+        return total / float(runs)
+
+    def _sampled_best_response(self, st: NState,
+                               policy_map: Optional[Dict[Tuple[int, bytes], np.ndarray]],
+                               use_avg_policy: bool,
+                               team: int,
+                               rng: Generator,
+                               action_samples: int,
+                               depth: int = 0) -> float:
         if np_is_terminal(st):
             return float(self._evaluate_utility(st, seat=0))
 
         if self.rollout_depth is not None and depth >= self.rollout_depth:
-            # Use rollout to approximate remaining value.
-            return float(self._estimate_rollout_value(st, target_seat=0, rng=self.rng))
+            return float(self._estimate_rollout_value(st, target_seat=0, rng=rng))
 
-        seat = int(st.cur_player)
-        team = int(TEAM_INDEX[seat])
-        obs = np_build_obs(st, seat)
+        obs = np_build_obs(st, int(st.cur_player))
         legal_mask = (obs[0] > 0).astype(np.int32)
         legal_actions = np.nonzero(legal_mask)[0]
-        subset_masks = self._subset_sum_masks_cached(st.table, legal_actions)
         if legal_actions.size == 0:
-            return float(self._policy_value_recursive(st, target_team, policy_map, use_avg_policy, depth + 1))
+            return float(self._evaluate_utility(st, seat=0))
 
-        if target_team is not None and team == target_team:
-            if target_team == 0:
-                best_val = float('-inf')
-                for a in legal_actions:
-                    diff = self._apply_action_inplace(st, int(a), subset_mask=subset_masks.get(int(a)))
-                    val = self._policy_value_recursive(st, target_team, policy_map, use_avg_policy, depth + 1)
+        subset_masks = self._subset_sum_masks_cached(st.table, legal_actions)
+        seat = int(st.cur_player)
+        team_idx = int(TEAM_INDEX[seat])
+
+        if team_idx == team:
+            samples = max(int(action_samples), 1)
+            best_val = float('-inf') if team == 0 else float('inf')
+            for action in legal_actions:
+                action_total = 0.0
+                for _ in range(samples):
+                    diff = self._apply_action_inplace(st, int(action), subset_mask=subset_masks.get(int(action)))
+                    val = self._sampled_best_response(st, policy_map, use_avg_policy, team, rng, action_samples, depth + 1)
+                    action_total += float(val)
                     self._undo_action(st, diff)
-                    if val > best_val:
-                        best_val = val
-                if not np.isfinite(best_val):
-                    best_val = 0.0
-                return float(best_val)
-            else:
-                worst_val = float('inf')
-                for a in legal_actions:
-                    diff = self._apply_action_inplace(st, int(a), subset_mask=subset_masks.get(int(a)))
-                    val = self._policy_value_recursive(st, target_team, policy_map, use_avg_policy, depth + 1)
-                    self._undo_action(st, diff)
-                    if val < worst_val:
-                        worst_val = val
-                if not np.isfinite(worst_val):
-                    worst_val = 0.0
-                return float(worst_val)
+                avg_val = action_total / float(samples)
+                if team == 0:
+                    if avg_val > best_val:
+                        best_val = avg_val
+                else:
+                    if avg_val < best_val:
+                        best_val = avg_val
+            if not np.isfinite(best_val):
+                best_val = 0.0
+            return float(best_val)
 
         probs = self._policy_action_probs(seat, obs, policy_map, use_avg_policy)
+        choice = int(self._safe_sample(probs, legal_mask, rng))
+        diff = self._apply_action_inplace(st, choice, subset_mask=subset_masks.get(choice))
+        val = self._sampled_best_response(st, policy_map, use_avg_policy, team, rng, action_samples, depth + 1)
+        self._undo_action(st, diff)
+        return float(val)
+
+    def _estimate_best_response_value(self, st: NState,
+                                      policy_map: Optional[Dict[Tuple[int, bytes], np.ndarray]],
+                                      use_avg_policy: bool,
+                                      team: int,
+                                      rng: Generator,
+                                      rollouts: int,
+                                      action_samples: int) -> float:
+        runs = max(int(rollouts), 1)
         total = 0.0
-        for a in legal_actions:
-            prob = float(probs[int(a)])
-            if prob <= 0.0:
-                continue
-            diff = self._apply_action_inplace(st, int(a), subset_mask=subset_masks.get(int(a)))
-            val = self._policy_value_recursive(st, target_team, policy_map, use_avg_policy, depth + 1)
-            self._undo_action(st, diff)
-            total += prob * float(val)
-        return float(total)
+        for _ in range(runs):
+            total += self._sampled_best_response(st, policy_map, use_avg_policy, team, rng, action_samples)
+        return total / float(runs)
 
     def compute_exploitability(self, episodes: int = 8, seed: int = 12345,
-                               use_avg_policy: bool = True) -> Dict[str, float]:
-        """Estimate exploitability by sampling deals and computing team best responses."""
+                               use_avg_policy: bool = True,
+                               config: Optional[ExploitabilityConfig] = None) -> Dict[str, float]:
+        """Estimate exploitability via Monte Carlo best responses."""
         if episodes <= 0:
             raise ValueError("episodes must be positive for exploitability computation")
 
+        cfg = (config.sanitized() if config is not None else self.exploit_config).sanitized()
         policy_map = self.get_average_policy() if use_avg_policy else None
         total_value = 0.0
         total_br0 = 0.0
         total_br1 = 0.0
+        rng = Generator(PCG64(seed + 424242))
 
         for ep in trange(episodes, desc='Exploitability'):
             deal_rng = Generator(PCG64(seed + 1000 + ep))
-            st = np_init_state(deal_rng)
-            base_val = self._policy_value_recursive(st, None, policy_map, use_avg_policy)
-            br0_val = self._policy_value_recursive(st, 0, policy_map, use_avg_policy)
-            br1_val = self._policy_value_recursive(st, 1, policy_map, use_avg_policy)
-            total_value += float(base_val)
-            total_br0 += float(br0_val)
-            total_br1 += float(br1_val)
+            base_state = np_init_state(deal_rng)
+
+            policy_state = np_clone_state(base_state)
+            total_value += self._estimate_policy_value_monte_carlo(
+                policy_state,
+                policy_map,
+                use_avg_policy,
+                rng,
+                cfg.policy_rollouts,
+            )
+
+            br0_state = np_clone_state(base_state)
+            total_br0 += self._estimate_best_response_value(
+                br0_state,
+                policy_map,
+                use_avg_policy,
+                team=0,
+                rng=rng,
+                rollouts=cfg.best_response_rollouts,
+                action_samples=cfg.opponent_samples,
+            )
+
+            br1_state = np_clone_state(base_state)
+            total_br1 += self._estimate_best_response_value(
+                br1_state,
+                policy_map,
+                use_avg_policy,
+                team=1,
+                rng=rng,
+                rollouts=cfg.best_response_rollouts,
+                action_samples=cfg.opponent_samples,
+            )
 
         inv_eps = 1.0 / float(episodes)
         avg_value = total_value * inv_eps
@@ -1122,6 +1257,93 @@ class CFRTrainer:
             'gain_team1': float(gain1),
         }
 
+    def _perform_evaluations(
+        self,
+        iteration: int,
+        schedule: Optional[EvaluationSchedule],
+        base_seed: int,
+        best_save_path: Optional[str],
+        best_save_kind: Optional[str],
+        verbose: bool,
+    ) -> None:
+        if schedule is None or not schedule.should_run(iteration):
+            return
+        if self.tlogger is None and best_save_path is None:
+            return
+
+        episodes = schedule.resolved_episodes()
+        use_avg = schedule.use_avg_policy
+
+        if self.tlogger is not None:
+            selfplay_metrics = self.evaluate(
+                episodes=episodes,
+                seed=base_seed + 7777 + iteration,
+                selfplay=True,
+                use_avg_policy=use_avg,
+            )
+            for k, v in selfplay_metrics.items():
+                self.tlogger.writer.add_scalar(f"EvalSelf/{k}", float(v), iteration)
+        else:
+            selfplay_metrics = {}
+
+        vsrnd_metrics = self.evaluate(
+            episodes=episodes,
+            seed=base_seed + 8888 + iteration,
+            selfplay=False,
+            use_avg_policy=use_avg,
+        )
+
+        if self.tlogger is not None:
+            for k, v in vsrnd_metrics.items():
+                self.tlogger.writer.add_scalar(f"EvalVsRandom/{k}", float(v), iteration)
+
+        if best_save_path is not None and vsrnd_metrics:
+            win0 = float(vsrnd_metrics.get("win_rate_team0", 0.0))
+            if win0 > self.best_vs_random_win_rate:
+                self.best_vs_random_win_rate = win0
+                kind = best_save_kind if best_save_kind else "avg"
+                try:
+                    self.save(best_save_path, kind=kind)
+                    if verbose:
+                        print(
+                            f"[CFR] Saved new best checkpoint to {best_save_path} "
+                            f"(win_rate_team0={win0:.3f})"
+                        )
+                except Exception as exc:
+                    if verbose:
+                        print(f"[CFR] WARNING: failed to save best checkpoint to {best_save_path}: {exc}")
+
+    def _maybe_compute_exploitability(
+        self,
+        iteration: int,
+        schedule: Optional[ExploitabilitySchedule],
+        default_episodes: int,
+        seed: int,
+        verbose: bool,
+    ) -> Optional[Dict[str, float]]:
+        if schedule is None or not schedule.should_run(iteration):
+            return None
+
+        exploit_eps = schedule.resolved_episodes(default_episodes)
+        try:
+            stats = self.compute_exploitability(
+                episodes=exploit_eps,
+                seed=seed + 9999 + iteration,
+                use_avg_policy=schedule.use_avg_policy,
+                config=self.exploit_config,
+            )
+        except Exception as exc:
+            if verbose:
+                print(f"[CFR] WARNING: exploitability computation failed at iter {iteration}: {exc}")
+            return None
+
+        if self.tlogger is not None:
+            for key, val in stats.items():
+                self.tlogger.writer.add_scalar(f"Exploitability/{key}", float(val), iteration)
+        if verbose:
+            print(f"[CFR] Iter {iteration}: exploitability {stats['exploitability']:.4f}")
+        return stats
+
     def train(self, iterations: int = 1000, seed: int = 42, verbose: bool = False, log_every: int = 100,
             eval_every: Optional[int] = None, eval_episodes: int = 32, eval_use_avg_policy: bool = True,
             batch_size: Optional[int] = None, traversals_per_deal: Optional[int] = 1,
@@ -1133,6 +1355,25 @@ class CFRTrainer:
 
         Each iteration samples B independent deals and accumulates regrets/strategy.
         """
+        eval_schedule = (
+            EvaluationSchedule(
+                every=eval_every,
+                episodes=eval_episodes,
+                use_avg_policy=eval_use_avg_policy,
+            )
+            if (eval_every is not None and eval_every > 0)
+            else None
+        )
+        exploit_schedule = (
+            ExploitabilitySchedule(
+                every=exploit_every,
+                episodes=exploit_episodes,
+                use_avg_policy=exploit_use_avg_policy,
+            )
+            if (exploit_every is not None and exploit_every > 0)
+            else None
+        )
+
         for it in trange(1, iterations + 1, desc="Iter"):
             t0 = time.time()
             if self.branch_topk is not None:
@@ -1180,48 +1421,21 @@ class CFRTrainer:
                     self.tlogger.writer.add_scalar("CFR/seat0_traversals", float(seat0_visits), it)
 
 
-            do_eval = (eval_every is not None and eval_every > 0 and (it % eval_every == 0))
-            if do_eval and (self.tlogger is not None or best_save_path is not None):
-                selfplay_metrics = self.evaluate(episodes=eval_episodes, seed=seed + 7777 + it,
-                                                selfplay=True, use_avg_policy=eval_use_avg_policy)
-                for k, v in selfplay_metrics.items():
-                    self.tlogger.writer.add_scalar(f"EvalSelf/{k}", float(v), it)
-
-                vsrnd_metrics = self.evaluate(episodes=eval_episodes, seed=seed + 8888 + it,
-                                            selfplay=False, use_avg_policy=eval_use_avg_policy)
-                if self.tlogger is not None:
-                    for k, v in vsrnd_metrics.items():
-                        self.tlogger.writer.add_scalar(f"EvalVsRandom/{k}", float(v), it)
-
-                if best_save_path is not None and vsrnd_metrics:
-                    win0 = float(vsrnd_metrics.get("win_rate_team0", 0.0))
-                    if win0 > self.best_vs_random_win_rate:
-                        self.best_vs_random_win_rate = win0
-                        kind = best_save_kind if best_save_kind else "avg"
-                        try:
-                            self.save(best_save_path, kind=kind)
-                            print(f"[CFR] Saved new best checkpoint to {best_save_path} (win_rate_team0={win0:.3f})")
-                        except Exception as exc:
-                            print(f"[CFR] WARNING: failed to save best checkpoint to {best_save_path}: {exc}")
-
-            do_exploit = (exploit_every is not None and exploit_every > 0 and (it % exploit_every == 0))
-            if do_exploit:
-                exploit_eps = exploit_episodes if (exploit_episodes is not None and exploit_episodes > 0) else eval_episodes
-                try:
-                    exploit_stats = self.compute_exploitability(
-                        episodes=exploit_eps,
-                        seed=seed + 9999 + it,
-                        use_avg_policy=exploit_use_avg_policy
-                    )
-                except Exception as exc:
-                    if verbose:
-                        print(f"[CFR] WARNING: exploitability computation failed at iter {it}: {exc}")
-                else:
-                    if self.tlogger is not None:
-                        for key, val in exploit_stats.items():
-                            self.tlogger.writer.add_scalar(f"Exploitability/{key}", float(val), it)
-                    if verbose:
-                        print(f"[CFR] Iter {it}: exploitability {exploit_stats['exploitability']:.4f}")
+            self._perform_evaluations(
+                iteration=it,
+                schedule=eval_schedule,
+                base_seed=seed,
+                best_save_path=best_save_path,
+                best_save_kind=best_save_kind,
+                verbose=verbose,
+            )
+            self._maybe_compute_exploitability(
+                iteration=it,
+                schedule=exploit_schedule,
+                default_episodes=eval_episodes,
+                seed=seed,
+                verbose=verbose,
+            )
             t1 = time.time()
             if self.tlogger is not None:
                 self.tlogger.writer.add_scalar("dt", t1-t0, it)
