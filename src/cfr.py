@@ -30,6 +30,16 @@ class InfoNode:
             return positive_regrets / norm_sum
         else:
             return np.ones(self.legal_actions.size) / self.legal_actions.size
+    
+    @property
+    def policy(self) -> np.ndarray:
+        norm_sum = np.sum(self.strategy_sum)
+        if norm_sum > 0:
+            return self.strategy_sum / norm_sum
+        else:
+            # If no strategies were accumulated, return a uniform random strategy.
+            return np.ones(self.legal_actions.size) / self.legal_actions.size
+
 class CFRTrainer:
     """
         1. If node is terminal return reward
@@ -42,7 +52,7 @@ class CFRTrainer:
     
     def _get_or_create_node(self, info_set_key, legal_actions) -> InfoNode:
         if info_set_key not in self.info_set_map:
-            self.info_set_map[info_set_key] = InfoNode(legal_actions)
+            self.info_set_map[info_set_key] = InfoNode(np.array(legal_actions))
         return self.info_set_map[info_set_key]
     
     def _cfr_recursive(self , state:pyspiel.State, traversing_player, reach_p0, reach_p1):
@@ -62,9 +72,9 @@ class CFRTrainer:
         
         #player node
         #current player is who is playing right now, traversing_player is the perspective
-        node = self._get_or_create_node(state.information_state_string(), np.array(state.legal_actions()))
+        node = self._get_or_create_node(state.information_state_string(), state.legal_actions()) #players need to have different information state string
         
-        node_util_for_current_player = 0
+        node_util_for_traversing_player = 0
         action_utils = np.zeros(len(state.legal_actions()))    
         
         for i, action in enumerate(state.legal_actions()):
@@ -75,29 +85,59 @@ class CFRTrainer:
             else:
                 action_utils[i] = self._cfr_recursive(next_state, traversing_player, reach_p0 , reach_p1 * node.local_strategy[i])
         
-        node_util_for_current_player = np.sum(node.local_strategy * action_utils) 
+        node_util_for_traversing_player = np.sum(node.local_strategy * action_utils) 
         
         if state.current_player() == traversing_player:
-            reach_prob = reach_p0 if state.current_player() == traversing_player else reach_p1
-            opponent_reach_prob = reach_p1 if state.current_player() == traversing_player else reach_p0
+            reach_prob = reach_p0 if 0 == traversing_player else reach_p1
+            opponent_reach_prob = reach_p1 if 0 == traversing_player else reach_p0
                         
-            regret = action_utils -node_util_for_current_player
+            regret = action_utils - node_util_for_traversing_player
             node.regret_sum += opponent_reach_prob * regret
             node.strategy_sum += reach_prob * node.local_strategy
             
         node.local_strategy = node.get_strategy()
         
-        return node_util_for_current_player
+        return node_util_for_traversing_player
+    
+    def get_openspiel_policy(self) -> policy.TabularPolicy:
+        tabular_policy = policy.TabularPolicy(self.game)
+        for state_key, infoset in self.info_set_map.items():
+            i = tabular_policy.state_lookup[state_key]
+            policy_probs = np.zeros(self.game.num_distinct_actions())
+            policy_probs[infoset.legal_actions] = infoset.policy
+            tabular_policy.action_probability_array[i] = policy_probs
+        return tabular_policy
 
     def train(self, steps: int, eval_interval: int = 1000):
+        exploitability_history = []
         for t in tqdm(range(steps), desc="CFR Training"):
-            for i in range(2):
+            for i in range(self.game.num_players()):
                 initial_state = self.game.new_initial_state()
                 self._cfr_recursive(initial_state, i, 1.0, 1.0)
+            
+            if (t + 1) % eval_interval == 0:
+                policy = self.get_openspiel_policy()
+                expl = exploitability.exploitability(self.game, policy)
+                exploitability_history.append((t + 1, expl))
+                
+        return exploitability_history
+
+def plot_exploitability(history):
+    iterations, expl_values = zip(*history)
+    
+    plt.figure(figsize=(10, 6))
+    plt.plot(iterations, expl_values, marker='o', linestyle='-', markersize=4)
+    plt.title('Exploitability of CFR Agent over Time')
+    plt.xlabel('Training Iterations')
+    plt.ylabel('Exploitability (NashConv)')
+    plt.grid(True)
+    plt.show()
+    plt.savefig("plot1.png")
 
 if __name__ == "__main__":
     #Load the openspiel game which already provides the tree, in our case we will generate the tree in montecarlo way
     kuhn_poker_game = pyspiel.load_game("kuhn_poker")
 
     trainer = CFRTrainer(game=kuhn_poker_game)
-    history = trainer.train(steps=100000)
+    history = trainer.train(steps=500, eval_interval=10)
+    plot_exploitability(history=history)
