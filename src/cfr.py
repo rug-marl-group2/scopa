@@ -122,22 +122,90 @@ class CFRTrainer:
                 
         return exploitability_history
 
-def plot_exploitability(history):
-    iterations, expl_values = zip(*history)
+class RandomPolicy(policy.Policy):
+    """Policy that chooses actions uniformly at random."""
+    def __init__(self, game):
+        all_players = list(range(game.num_players()))
+        super().__init__(game, all_players)
+
+    def action_probabilities(self, state):
+        legal_actions = state.legal_actions()
+        prob = 1.0 / len(legal_actions)
+        return {action: prob for action in legal_actions}
+
+def evaluate_agent(game, trained_policy, opponent_policy, num_episodes=10000):
+    """
+    Evaluates a policy against an opponent, playing half the games in each seat
+    to remove seat bias. Returns the unbiased average reward and bankroll.
+    """
+    total_winnings = 0
+    bankroll_history = []
     
-    plt.figure(figsize=(10, 6))
+    for episode in range(num_episodes):
+        if episode < num_episodes / 2:
+            agent_seat = 0
+            policies = [trained_policy, opponent_policy]
+        else:
+            agent_seat = 1
+            policies = [opponent_policy, trained_policy]
+            
+        state = game.new_initial_state()
+        while not state.is_terminal():
+            if state.is_chance_node():
+                # Correctly sample a chance outcome
+                outcomes = state.chance_outcomes()
+                acts, probs = zip(*outcomes)
+                action = np.random.choice(acts, p=probs)
+                state.apply_action(action)
+            else:
+                player = state.current_player()
+                action_probs = policies[player].action_probabilities(state)
+                actions, probs = zip(*action_probs.items())
+                action = np.random.choice(actions, p=probs)
+                state.apply_action(action)
+        
+        # Correctly aggregate the reward based on the agent's seat
+        total_winnings += state.returns()[agent_seat]
+        bankroll_history.append(total_winnings)
+        
+    return total_winnings / num_episodes, bankroll_history
+
+def plot(history, bankroll):
+    plt.figure(figsize=(12, 5))
+
+    plt.subplot(1, 2, 1)
+    iterations, expl_values = zip(*history)
     plt.plot(iterations, expl_values, marker='o', linestyle='-', markersize=4)
-    plt.title('Exploitability of CFR Agent over Time')
+    plt.title('Exploitability over Time')
     plt.xlabel('Training Iterations')
     plt.ylabel('Exploitability (NashConv)')
     plt.grid(True)
+    
+    # Bankroll Plot
+    plt.subplot(1, 2, 2)
+    plt.plot(bankroll)
+    plt.title('Bankroll vs. Random Agent')
+    plt.xlabel('Games Played')
+    plt.ylabel('Cumulative Winnings')
+    plt.grid(True)
+    
+    plt.tight_layout()
+    plt.savefig("kuhn_final_performance.png")
     plt.show()
-    plt.savefig("plot1.png")
 
 if __name__ == "__main__":
-    #Load the openspiel game which already provides the tree, in our case we will generate the tree in montecarlo way
     kuhn_poker_game = pyspiel.load_game("kuhn_poker")
 
     trainer = CFRTrainer(game=kuhn_poker_game)
-    history = trainer.train(steps=500, eval_interval=10)
-    plot_exploitability(history=history)
+    history = trainer.train(steps=50000, eval_interval=500)
+    
+    cfr_policy = trainer.get_openspiel_policy()
+    random_policy = RandomPolicy(kuhn_poker_game)
+
+    avg_reward, bankroll = evaluate_agent(
+        kuhn_poker_game, 
+        cfr_policy, 
+        random_policy, 
+        num_episodes=20000
+    )
+    plot(history, bankroll)
