@@ -165,7 +165,7 @@ def evaluate_agent(game, trained_policy, opponent_policy, num_episodes=10000):
                 state.apply_action(action)
         
         # Correctly aggregate the reward based on the agent's seat
-        total_winnings += state.returns()[agent_seat]
+        total_winnings += state.rewards()[agent_seat]
         bankroll_history.append(total_winnings)
         
     return total_winnings / num_episodes, bankroll_history
@@ -208,4 +208,5 @@ if __name__ == "__main__":
         random_policy, 
         num_episodes=20000
     )
+    print("average reward", avg_reward)
     plot(history, bankroll)
