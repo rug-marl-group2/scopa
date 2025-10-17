@@ -62,7 +62,7 @@ class CFRTrainer:
         
         if state.is_chance_node():
             node_utility = 0.0
-            #iterate over all possible actions
+            #iterate over all possible actions (Infeasible in scopa, here we need to do do monte carlo cfr or whatever other method)
             for outcome,prob in state.chance_outcomes():
                 next_state = state.clone() #Because openspiel nodes are mutable we want a new one 
                 next_state.apply_action(outcome)
