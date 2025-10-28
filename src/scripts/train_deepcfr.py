@@ -4,13 +4,13 @@ Deep CFR training script for 4-player imperfect-information games.
 Example usages:
 
 Test run:
-ipython src/train_deepcfr.py -- --mode mlp --iters 2 --traversals_per_seat 16 --regret_steps 10 --policy_steps 10
+ipython src/scripts/train_deepcfr.py -- --mode mlp --iters 2 --traversals_per_seat 16 --regret_steps 10 --policy_steps 10
 
 Wide MLP, more traversals, lower LR:
-ipython src/train_deepcfr.py -- --mode mlp --mlp_hidden 1024,512 --traversals_per_seat 1024 --lr_regret 0.0005 --lr_policy 0.0005 --iters 200
+ipython src/scripts/train_deepcfr.py -- --mode mlp --mlp_hidden 1024,512 --traversals_per_seat 1024 --lr_regret 0.0005 --lr_policy 0.0005 --iters 200
 
 Conv2D + MLP, default params:
-ipython src/train_deepcfr.py -- --mode conv2d_mlp --conv_input_C 1 --conv_input_H 4 --conv_input_W 40 --iters 100
+ipython src/scripts/train_deepcfr.py -- --mode conv2d_mlp --conv_input_C 1 --conv_input_H 4 --conv_input_W 40 --iters 100
 """
 
 import argparse
@@ -18,11 +18,11 @@ import argparse
 import numpy as np
 import torch
 
-import games.scopa as env_mod
-from deep_cfr.buffers import PolicyMemory, RegretMemory
-from deep_cfr.loggers import RunLogger
-from deep_cfr.nets import FlexibleNet
-from deep_cfr.trainer import DeepCFRTrainer
+import src.games.scopa as env_mod
+from src.deep_cfr.buffers import PolicyMemory, RegretMemory
+from src.deep_cfr.loggers import RunLogger
+from src.deep_cfr.nets import FlexibleNet
+from src.deep_cfr.trainer import DeepCFRTrainer
 
 
 def parse_int_list(s: str):

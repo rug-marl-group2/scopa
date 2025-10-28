@@ -9,7 +9,7 @@ from typing import Callable, List, Tuple
 import numpy as np
 import torch
 
-from deep_cfr.nets import FlexibleNet, masked_softmax
+from src.deep_cfr.nets import FlexibleNet, masked_softmax
 
 
 def _sample_from_policynet(

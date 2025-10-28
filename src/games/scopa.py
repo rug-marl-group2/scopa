@@ -18,7 +18,7 @@ import random
 import numpy as np
 from gymnasium import spaces
 
-from tlogger import TLogger  # optional logger
+from src.tlogger import TLogger  # optional logger
 
 NUM_ITERS = 100  # Number of iterations before truncation
 PRINT_DEBUG = False

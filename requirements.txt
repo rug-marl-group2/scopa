@@ -8,3 +8,4 @@ tensorboard
 tqdm
 jax
 matplotlib
+torch

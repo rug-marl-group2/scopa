@@ -12,11 +12,11 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from deep_cfr.buffers import PolicyMemory, RegretMemory
-from deep_cfr.evaluator import evaluate_selfplay, evaluate_vs_random
-from deep_cfr.loggers import RunLogger
-from deep_cfr.nets import FlexibleNet, masked_softmax
-from deep_cfr.traverser import ExternalSamplingTraverser
+from src.deep_cfr.buffers import PolicyMemory, RegretMemory
+from src.deep_cfr.evaluator import evaluate_selfplay, evaluate_vs_random
+from src.deep_cfr.loggers import RunLogger
+from src.deep_cfr.nets import FlexibleNet, masked_softmax
+from src.deep_cfr.traverser import ExternalSamplingTraverser
 
 
 class DeepCFRTrainer:

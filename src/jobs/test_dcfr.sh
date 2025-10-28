@@ -18,4 +18,4 @@ source .venv/bin/activate
 echo "Virtual environment activated."
 
 echo "Testing the algorithm with a small run..."
-srun python src/scripts//train_deepcfr.py --mode mlp --mlp_hidden 8,16 --traversals_per_seat 5 --lr_regret 0.0005 --lr_policy 0.0005 --iters 1 --device cuda --regret_mem 1000 --policy_mem 1000
+srun ipython src/scripts//train_deepcfr.py -- --mode mlp --mlp_hidden 8,16 --traversals_per_seat 5 --lr_regret 0.0005 --lr_policy 0.0005 --iters 1 --device cuda --regret_mem 1000 --policy_mem 1000
