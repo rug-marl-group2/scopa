@@ -1,7 +1,5 @@
 """
 Replay buffers for Deep CFR: RegretMemory and PolicyMemory.
-
-Each memory uses reservoir sampling to maintain a fixed-size buffer of experience tuples.
 """
 
 import random
@@ -45,6 +43,7 @@ class ReservoirBuffer:
     def sample(self, batch_size: int):
         """
         Sample a batch of items from the buffer.
+
         :param batch_size: number of items to sample
         :return: list of sampled items
         """
@@ -58,6 +57,10 @@ class RegretMemory:
       - info_tensor: torch.float (in_dim,)
       - legal_mask : torch.float (A,)
       - advantages : torch.float (A,)  # instantaneous regrets A_p
+
+    :param capacity: maximum number of items to store
+    :param device: torch device for sampling
+    :param seed: optional random seed for reproducibility
     """
 
     def __init__(self, capacity: int, device: str = "cpu", seed: Optional[int] = None):
@@ -88,6 +91,10 @@ class PolicyMemory:
     Stores tuples: (info_tensor, legal_mask, target_probs, weight)
       - target_probs: torch.float (A,)  # σ target at this infoset
       - weight      : float             # reach weight (for weighted CE)
+    
+    :param capacity: maximum number of items to store
+    :param device: torch device for sampling
+    :param seed: optional random seed for reproducibility
     """
 
     def __init__(self, capacity: int, device: str = "cpu", seed: Optional[int] = None):

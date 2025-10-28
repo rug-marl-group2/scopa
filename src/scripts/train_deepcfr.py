@@ -18,7 +18,7 @@ import argparse
 import numpy as np
 import torch
 
-import env as env_mod
+import games.scopa as env_mod
 from deep_cfr.buffers import PolicyMemory, RegretMemory
 from deep_cfr.loggers import RunLogger
 from deep_cfr.nets import FlexibleNet
