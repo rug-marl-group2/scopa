@@ -1,4 +1,4 @@
-'''
+"""
 Deep CFR training script for 4-player imperfect-information games.
 
 Example usages:
@@ -11,50 +11,55 @@ ipython src/train_deepcfr.py -- --mode mlp --mlp_hidden 1024,512 --traversals_pe
 
 Conv2D + MLP, default params:
 ipython src/train_deepcfr.py -- --mode conv2d_mlp --conv_input_C 1 --conv_input_H 4 --conv_input_W 40 --iters 100
-'''
+"""
 
 import argparse
+
 import numpy as np
 import torch
-from deep_cfr.nets import FlexibleNet
-from deep_cfr.buffers import RegretMemory, PolicyMemory
-from deep_cfr.trainer import DeepCFRTrainer
-import env as env_mod  
+
+import env as env_mod
+from deep_cfr.buffers import PolicyMemory, RegretMemory
 from deep_cfr.loggers import RunLogger
+from deep_cfr.nets import FlexibleNet
+from deep_cfr.trainer import DeepCFRTrainer
 
 
 def parse_int_list(s: str):
-    '''
+    """
     Parse a comma-separated string into a list of ints.
-    
+
     :param s: Comma-separated string, e.g., "512,256"
     :return: List of integers, e.g., [512, 256]
-    '''
+    """
     # "512,256" -> [512, 256]; "" or None -> []
     if s is None or s == "":
         return []
     return [int(x) for x in s.split(",") if x.strip() != ""]
 
+
 def parse_float_list(s: str):
-    '''
+    """
     Parse a comma-separated string into a list of floats.
 
     :param s: Comma-separated string, e.g., "0.1,0.01"
     :return: List of floats, e.g., [0.1, 0.01]
-    '''
-    # "0.1,0.01" -> [0.1, 0.01]; "" or None -> []   
+    """
+    # "0.1,0.01" -> [0.1, 0.01]; "" or None -> []
     if s is None or s == "":
         return []
     return [float(x) for x in s.split(",") if x.strip() != ""]
 
 
 def build_argparser():
-    '''Build the argument parser for Deep CFR training.'''
+    """Build the argument parser for Deep CFR training."""
 
     p = argparse.ArgumentParser("Deep CFR trainer (Scopa/2v2)")
 
     # --- device/seed ---
-    p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
+    p.add_argument(
+        "--device", type=str, default="auto", choices=["auto", "cpu", "cuda"]
+    )
     p.add_argument("--seed", type=int, default=1234)
 
     # --- model mode ---
@@ -63,8 +68,15 @@ def build_argparser():
     # --- MLP config ---
     p.add_argument("--in_dim", type=int, default=160, help="Flattened obs size (4x40)")
     p.add_argument("--mlp_hidden", type=parse_int_list, default="512,256")
-    p.add_argument("--mlp_act", type=str, default="relu", choices=["relu","gelu","silu","tanh","elu","lrelu","none"])
-    p.add_argument("--mlp_norm", type=str, default="none", choices=["none","batch","layer"])
+    p.add_argument(
+        "--mlp_act",
+        type=str,
+        default="relu",
+        choices=["relu", "gelu", "silu", "tanh", "elu", "lrelu", "none"],
+    )
+    p.add_argument(
+        "--mlp_norm", type=str, default="none", choices=["none", "batch", "layer"]
+    )
     p.add_argument("--mlp_dropout", type=float, default=0.0)
     p.add_argument("--mlp_residual", action="store_true")
 
@@ -77,7 +89,9 @@ def build_argparser():
     p.add_argument("--conv_strides", type=parse_int_list, default="1,1")
     p.add_argument("--conv_paddings", type=parse_int_list, default="1,1")
     p.add_argument("--conv_act", type=str, default="relu")
-    p.add_argument("--conv_norm", type=str, default="none", choices=["none","batch","layer"])
+    p.add_argument(
+        "--conv_norm", type=str, default="none", choices=["none", "batch", "layer"]
+    )
     p.add_argument("--conv_dropout2d", type=float, default=0.0)
     p.add_argument("--conv_residual", action="store_true")
 
@@ -108,7 +122,6 @@ def build_argparser():
     p.add_argument("--no_tb", action="store_true", help="Disable TensorBoard")
 
     return p
-
 
 
 def make_env():
@@ -195,8 +208,11 @@ def build_nets(args, device):
 
 def main():
     args = build_argparser().parse_args()
-    device = torch.device("cuda" if (args.device == "auto" and torch.cuda.is_available()) else
-                          (args.device if args.device in ["cuda", "cpu"] else "cpu"))
+    device = torch.device(
+        "cuda"
+        if (args.device == "auto" and torch.cuda.is_available())
+        else (args.device if args.device in ["cuda", "cpu"] else "cpu")
+    )
     torch.manual_seed(args.seed)
 
     # logger
@@ -210,8 +226,16 @@ def main():
 
     # Nets & buffers
     regret_nets, policy_nets = build_nets(args, device)
-    regret_mems = [RegretMemory(capacity=args.regret_mem, device=str(device), seed=args.seed + i) for i in range(4)]
-    policy_mems = [PolicyMemory(capacity=args.policy_mem, device=str(device), seed=args.seed + 100 + i) for i in range(4)]
+    regret_mems = [
+        RegretMemory(capacity=args.regret_mem, device=str(device), seed=args.seed + i)
+        for i in range(4)
+    ]
+    policy_mems = [
+        PolicyMemory(
+            capacity=args.policy_mem, device=str(device), seed=args.seed + 100 + i
+        )
+        for i in range(4)
+    ]
 
     # Trainer
     trainer = DeepCFRTrainer(
@@ -224,7 +248,7 @@ def main():
         lr_regret=args.lr_regret,
         lr_policy=args.lr_policy,
         weight_decay=args.weight_decay,
-        logger = logger
+        logger=logger,
     )
 
     trainer.run(
@@ -234,7 +258,7 @@ def main():
         regret_steps=args.regret_steps,
         policy_steps=args.policy_steps,
         eval_every=args.eval_every,
-        save_every=args.save_every
+        save_every=args.save_every,
     )
 
 

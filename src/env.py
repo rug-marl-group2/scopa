@@ -1,18 +1,22 @@
-from typing import Optional, Dict, Tuple
+from typing import Dict, Optional, Tuple
+
 from pettingzoo import AECEnv
 from pettingzoo.utils import wrappers
+
 # PettingZoo changed agent_selector export; support both styles
 try:
     from pettingzoo.utils.agent_selector import agent_selector as AgentSelector
 except Exception:  # pragma: no cover
     from pettingzoo.utils import agent_selector as _agent_selector_mod
+
     AgentSelector = _agent_selector_mod.agent_selector
 
-from gymnasium import spaces
-import numpy as np
-import itertools
 import copy
+import itertools
 import random
+
+import numpy as np
+from gymnasium import spaces
 
 from tlogger import TLogger  # optional logger
 
@@ -42,7 +46,7 @@ class Card:
 
 
 class Deck:
-    suits = ['picche', 'bello', 'fiori', 'cuori']
+    suits = ["picche", "bello", "fiori", "cuori"]
     ranks = list(range(1, 11))  # 1..7 plus 8=Jack, 9=Queen, 10=King
 
     def __init__(self, rng: Optional[random.Random] = None):
@@ -86,10 +90,12 @@ class ScopaGame:
     def __init__(self, logger: Optional[TLogger]):
         self.rng = random.Random()
         self.deck = Deck(self.rng)
-        self.players = [Player(1, 'player_0'),
-                        Player(2, 'player_1'),
-                        Player(1, 'player_2'),
-                        Player(2, 'player_3')]
+        self.players = [
+            Player(1, "player_0"),
+            Player(2, "player_1"),
+            Player(1, "player_2"),
+            Player(2, "player_3"),
+        ]
         self.table = []
         self.last_capture = None
         self.tlogger = logger
@@ -171,15 +177,29 @@ class ScopaGame:
             self.last_capture = None
 
         # Team captures
-        team1_captures = [card for player in self.players if player.side == 1 for card in player.captures]
-        team2_captures = [card for player in self.players if player.side == 2 for card in player.captures]
+        team1_captures = [
+            card
+            for player in self.players
+            if player.side == 1
+            for card in player.captures
+        ]
+        team2_captures = [
+            card
+            for player in self.players
+            if player.side == 2
+            for card in player.captures
+        ]
 
         team1_points = 0
         team2_points = 0
 
         # Scopas
-        team1_points += sum(player.scopas for player in self.players if player.side == 1)
-        team2_points += sum(player.scopas for player in self.players if player.side == 2)
+        team1_points += sum(
+            player.scopas for player in self.players if player.side == 1
+        )
+        team2_points += sum(
+            player.scopas for player in self.players if player.side == 2
+        )
 
         # Most Cards
         if len(team1_captures) > len(team2_captures):
@@ -188,27 +208,37 @@ class ScopaGame:
             team2_points += 1
 
         # Most Coins ("ori") -> suit 'bello'
-        team1_coins = [card for card in team1_captures if card.suit == 'bello']
-        team2_coins = [card for card in team2_captures if card.suit == 'bello']
+        team1_coins = [card for card in team1_captures if card.suit == "bello"]
+        team2_coins = [card for card in team2_captures if card.suit == "bello"]
         if len(team1_coins) > len(team2_coins):
             team1_points += 1
         elif len(team2_coins) > len(team1_coins):
             team2_points += 1
 
         # Sette Bello (7 of Coins)
-        if any((c.rank == 7 and c.suit == 'bello') for c in team1_captures):
+        if any((c.rank == 7 and c.suit == "bello") for c in team1_captures):
             team1_points += 1
-        if any((c.rank == 7 and c.suit == 'bello') for c in team2_captures):
+        if any((c.rank == 7 and c.suit == "bello") for c in team2_captures):
             team2_points += 1
 
         # Primiera
         suit_priority = {7: 4, 6: 3, 1: 2, 5: 1, 4: 0, 3: 0, 2: 0}
-        team1_best = [max((c for c in team1_captures if c.suit == s),
-                          key=lambda c: suit_priority.get(c.rank, 0), default=None)
-                      for s in Deck.suits]
-        team2_best = [max((c for c in team2_captures if c.suit == s),
-                          key=lambda c: suit_priority.get(c.rank, 0), default=None)
-                      for s in Deck.suits]
+        team1_best = [
+            max(
+                (c for c in team1_captures if c.suit == s),
+                key=lambda c: suit_priority.get(c.rank, 0),
+                default=None,
+            )
+            for s in Deck.suits
+        ]
+        team2_best = [
+            max(
+                (c for c in team2_captures if c.suit == s),
+                key=lambda c: suit_priority.get(c.rank, 0),
+                default=None,
+            )
+            for s in Deck.suits
+        ]
         team1_prim = sum(suit_priority.get(c.rank, 0) for c in team1_best if c)
         team2_prim = sum(suit_priority.get(c.rank, 0) for c in team2_best if c)
         if team1_prim > team2_prim:
@@ -271,23 +301,28 @@ class MaScopaEnv(AECEnv):
 
         # suit indexing (shared everywhere)
         self._suit_offset = {
-            'cuori': 0,
-            'picche': 10,
-            'fiori': 20,
-            'bello': 30,
+            "cuori": 0,
+            "picche": 10,
+            "fiori": 20,
+            "bello": 30,
         }
 
         self.game = ScopaGame(logger=self.tlogger)
         self.possible_agents = [p.name for p in self.game.players]
-        self.agent_name_mapping = {agent: int(agent[-1]) for agent in self.possible_agents}
+        self.agent_name_mapping = {
+            agent: int(agent[-1]) for agent in self.possible_agents
+        }
 
         players = len(self.game.players)
         # hands, captures, history are per-player; table is once; plus scopas & current one-hot
         self.global_state_dim = (players * 3 * 40) + 40 + (players * 2)
 
-        self._action_spaces = {agent: spaces.Discrete(40) for agent in self.possible_agents}
+        self._action_spaces = {
+            agent: spaces.Discrete(40) for agent in self.possible_agents
+        }
         self._observation_spaces = {
-            agent: spaces.Box(0, 1, shape=(4, 40), dtype=np.float32) for agent in self.possible_agents
+            agent: spaces.Box(0, 1, shape=(4, 40), dtype=np.float32)
+            for agent in self.possible_agents
         }
 
         # PettingZoo/Gymnasium-conform reset
@@ -316,7 +351,9 @@ class MaScopaEnv(AECEnv):
         history = [self._encode_cards(p.history) for p in self.game.players]
         scopas = np.asarray([p.scopas for p in self.game.players], dtype=np.float32)
         current = np.zeros(len(self.game.players), dtype=np.float32)
-        if getattr(self, 'agent_selection', None) in getattr(self, 'agent_name_mapping', {}):
+        if getattr(self, "agent_selection", None) in getattr(
+            self, "agent_name_mapping", {}
+        ):
             current_index = self.agent_name_mapping[self.agent_selection]
             current[current_index] = 1.0
         feature_list = hands + [table] + captures + history + [scopas, current]
@@ -352,23 +389,27 @@ class MaScopaEnv(AECEnv):
 
         # Randomize the starting player (fairness)
         randstart = self._rng.randint(0, 3)
-        self.possible_agents = self.possible_agents[randstart:] + self.possible_agents[:randstart]
+        self.possible_agents = (
+            self.possible_agents[randstart:] + self.possible_agents[:randstart]
+        )
         self.agents = self.possible_agents[:]
 
         self.rewards = {agent: 0 for agent in self.agents}
         self._cumulative_rewards = {agent: 0 for agent in self.agents}
         self.terminations = {agent: False for agent in self.agents}
         self.truncations = {agent: False for agent in self.agents}
-        self.infos = {agent: {"action_mask": self.get_action_mask(agent)} for agent in self.agents}
+        self.infos = {
+            agent: {"action_mask": self.get_action_mask(agent)} for agent in self.agents
+        }
         self.observations = {agent: self.observe(agent) for agent in self.agents}
 
         self._agent_selector = AgentSelector(self.agents)
         self.agent_selection = self._agent_selector.next()
         return self.observations, self.infos
 
-    def get_action_mask(self, agent='current'):
+    def get_action_mask(self, agent="current"):
         off = self._suit_offset
-        if agent == 'current':
+        if agent == "current":
             action_mask = np.zeros(40, dtype=int)
             cur_idx = self.agent_name_mapping[self.agent_selection]
             for card in self.game.players[cur_idx].hand:
@@ -399,7 +440,10 @@ class MaScopaEnv(AECEnv):
         return None
 
     def step(self, action: int):
-        if self.terminations[self.agent_selection] or self.truncations[self.agent_selection]:
+        if (
+            self.terminations[self.agent_selection]
+            or self.truncations[self.agent_selection]
+        ):
             self._was_dead_step(action)
             return
 
@@ -452,8 +496,16 @@ class MaScopaEnv(AECEnv):
 
             if self.tlogger is not None and hasattr(self.tlogger, "writer"):
                 try:
-                    self.tlogger.writer.add_scalar("Scores/Side/0", self.cumulative_sides[0], getattr(self.tlogger, "simulation_clock", 0))
-                    self.tlogger.writer.add_scalar("Scores/Side/1", self.cumulative_sides[1], getattr(self.tlogger, "simulation_clock", 0))
+                    self.tlogger.writer.add_scalar(
+                        "Scores/Side/0",
+                        self.cumulative_sides[0],
+                        getattr(self.tlogger, "simulation_clock", 0),
+                    )
+                    self.tlogger.writer.add_scalar(
+                        "Scores/Side/1",
+                        self.cumulative_sides[1],
+                        getattr(self.tlogger, "simulation_clock", 0),
+                    )
                 except Exception:
                     pass
 

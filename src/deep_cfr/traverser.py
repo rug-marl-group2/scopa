@@ -7,14 +7,17 @@ This version avoids exponential recursion at target nodes by:
   all players from current PolicyNets.
 - Computing instantaneous regrets only at the current infoset (one-node update).
 """
+
 from __future__ import annotations
-from typing import Dict, List, Optional
+
 import copy
+from typing import Dict, List, Optional
+
 import numpy as np
 import torch
 
+from deep_cfr.buffers import PolicyMemory, RegretMemory
 from deep_cfr.nets import FlexibleNet, masked_softmax, positive_regret_policy
-from deep_cfr.buffers import RegretMemory, PolicyMemory
 
 
 class ExternalSamplingTraverser:
@@ -30,6 +33,14 @@ class ExternalSamplingTraverser:
       - env.observe(agent) -> (4, 40)
       - env.get_action_mask(agent) -> (40,)
       - copy.deepcopy(env) is efficient (ScopaGame.__deepcopy__ provided)
+
+    :param regret_nets: list of RegretNets for each seat
+    :param policy_nets: list of PolicyNets for each seat
+    :param regret_mems: list of RegretMemories for each seat
+    :param policy_mems: list of PolicyMemories for each seat
+    :param device: torch device for inference
+    :param strict_illegal: if True, raise error on illegal actions; else resample
+    :param rng: optional np.random.RandomState for reproducibility
     """
 
     def __init__(
@@ -55,27 +66,65 @@ class ExternalSamplingTraverser:
     # ---------- helpers ----------
     @staticmethod
     def _seat_from_agent(agent_name: str) -> int:
+        """
+        Extract seat index from agent name string.
+
+        :param agent_name: string like "player_0", "player_1", etc.
+        :return: seat index as integer
+        """
         return int(agent_name.split("_")[-1])
 
     @staticmethod
     def _flatten_obs(obs: np.ndarray) -> np.ndarray:
+        """
+        Flatten the observation array.
+
+        :param obs: observation array of shape (4, 40)
+        :return: flattened observation array of shape (160,)
+        """
         # obs: (4,40) -> (160,)
         return obs.astype(np.float32).reshape(-1)
 
     @staticmethod
     def _legal_mask(env, agent: str) -> np.ndarray:
+        """
+        Get the legal action mask for the given agent.
+
+        :param env: game environment
+        :param agent: agent name string
+        :return: legal action mask as a float32 numpy array
+        """
         return env.get_action_mask(agent).astype(np.float32)
 
     @staticmethod
     def _team_index(seat: int) -> int:
+        """
+        Map seat index to team index.
+
+        :param seat: seat index (0-3)
+        :return: team index (0 or 1)
+        """
         # seats 0,2 -> team 0 ; seats 1,3 -> team 1
         return seat % 2
 
     @staticmethod
     def _is_terminal(env) -> bool:
+        """
+        Check if the game has reached a terminal state.
+
+        :param env: game environment
+        :return: True if terminal, False otherwise
+        """
         return all(len(p.hand) == 0 for p in env.game.players)
 
     def _terminal_utility_for_seat(self, env, seat: int) -> float:
+        """
+        Get terminal utility for the given seat's team.
+
+        :param env: game environment
+        :param seat: seat index (0-3)
+        :return: terminal utility for the seat's team
+        """
         # Evaluate final points and map to seat utility
         team_scores = env.game.evaluate_round()
         return float(team_scores[self._team_index(seat)])
@@ -85,6 +134,9 @@ class ExternalSamplingTraverser:
         """
         From current env, sample ALL players from PolicyNets until terminal.
         Returns terminal utility for the ORIGINAL target seat's team.
+
+        :param env: game environment
+        :return: terminal utility for the target seat's team
         """
         assert self._rollout_target_seat is not None, "rollout target seat not set"
         while not all(env.terminations.values()) and not all(env.truncations.values()):
@@ -114,15 +166,19 @@ class ExternalSamplingTraverser:
         """
         Returns the value for target_seat from the current node
         while adding regret/policy samples along the path.
+
+        :param env: game environment
+        :param target_seat: seat index whose regrets we update
+        :return: node value for target_seat
         """
         if self._is_terminal(env):
             return self._terminal_utility_for_seat(env, target_seat)
 
         agent = env.agent_selection
         acting_seat = self._seat_from_agent(agent)
-        obs = env.observe(agent)                  # (4,40)
-        mask = self._legal_mask(env, agent)       # (40,)
-        obs_flat = self._flatten_obs(obs)         # (160,)
+        obs = env.observe(agent)  # (4,40)
+        mask = self._legal_mask(env, agent)  # (40,)
+        obs_flat = self._flatten_obs(obs)  # (160,)
 
         # --- store average-policy sample for the acting seat ---
         with torch.no_grad():
@@ -149,10 +205,15 @@ class ExternalSamplingTraverser:
                 adv_pred = self.regret_nets[target_seat](
                     torch.from_numpy(obs_flat[None, :]).to(self.device)
                 ).squeeze(0)
-                adv_sigma = positive_regret_policy(
-                    adv_pred[None, :],
-                    torch.from_numpy(mask[None, :]).to(self.device),
-                ).squeeze(0).cpu().numpy()
+                adv_sigma = (
+                    positive_regret_policy(
+                        adv_pred[None, :],
+                        torch.from_numpy(mask[None, :]).to(self.device),
+                    )
+                    .squeeze(0)
+                    .cpu()
+                    .numpy()
+                )
 
             # rollout value for each legal action
             action_values: Dict[int, float] = {}
@@ -184,10 +245,15 @@ class ExternalSamplingTraverser:
             with torch.no_grad():
                 x = torch.from_numpy(obs_flat[None, :]).to(self.device)
                 logits = self.policy_nets[acting_seat](x).squeeze(0)
-                probs = masked_softmax(
-                    logits[None, :],
-                    torch.from_numpy(mask[None, :]).to(self.device),
-                ).squeeze(0).cpu().numpy()
+                probs = (
+                    masked_softmax(
+                        logits[None, :],
+                        torch.from_numpy(mask[None, :]).to(self.device),
+                    )
+                    .squeeze(0)
+                    .cpu()
+                    .numpy()
+                )
             legal = np.nonzero(mask)[0]
             p = probs[legal]
             if p.sum() <= 0 or not np.isfinite(p).all():
