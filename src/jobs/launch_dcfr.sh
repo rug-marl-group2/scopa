@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --mem=32GB
 #SBATCH --time=24:00:00
-#SBATCH --job-name=deepcfr_job
+#SBATCH --job-name=1v1_scopa_dcfr
 #SBATCH --partition=gpu
 #SBATCH --gres=gpu:v100:1
 #SBATCH --nodes=1
@@ -18,6 +18,6 @@ source .venv/bin/activate
 echo "Virtual environment activated."
 
 echo "mlp 512, 1024 trav 1024 lr_r 0.0005 lr_p 0.0005 iters 200"
-srun ipython src/scripts/train_deepcfr.py -- --mode mlp --mlp_hidden 512,1024 --traversals_per_seat 1024 --lr_regret 0.0005 --lr_policy 0.0005 --iters 200 --device cuda
+srun ipython src/scripts/train_scopa1v1.py -- --mode mlp --mlp_hidden 512,1024 --traversals_per_player 1024 --lr_regret 0.0005 --lr_policy 0.0005 --iters 200 --device cuda
 
 # NOTE: for mlp 1024,512 trav 1024 lr_r 0.0001 lr_p 0.0001 -> iter takes about 4mins

@@ -1,11 +1,7 @@
-"""
-Deep CFR trainer for 4-player imperfect-information games.
-"""
+# src/deep_cfr/trainer.py  (parametric n-player version)
 
 from __future__ import annotations
-
-import sys
-import time
+import sys, time
 from typing import Callable, Dict, List, Optional
 
 import torch
@@ -21,22 +17,23 @@ from src.deep_cfr.traverser import ExternalSamplingTraverser
 
 class DeepCFRTrainer:
     """
-    Orchestrates Deep CFR:
-      - data collection via ExternalSamplingTraverser
-      - training RegretNet/PolicyNet per seat
-      - periodic evaluation + logging + checkpointing
+    Deep CFR trainer (n-player, imperfect-information).
 
-    :param make_env_fn: function that creates a new environment instance
-    :param regret_nets: List of 4 FlexibleNet regret networks, one per seat
-    :param policy_nets: List of 4 FlexibleNet policy networks, one per seat
-    :param regret_mems: List of 4 RegretMemory buffers, one per seat
-    :param policy_mems: List of 4 PolicyMemory buffers, one per seat
-    :param device: torch device for net inference/training
-    :param lr_regret: learning rate for regret nets
-    :param lr_policy: learning rate for policy nets
-    :param weight_decay: weight decay (L2 regularization) for optimizers
-    :param logger: optional RunLogger for logging training progress
-    :param grad_clip: optional max norm for gradient clipping
+    - Data collection via ExternalSamplingTraverser (external sampling CFR)
+    - Training regret/policy heads per player
+    - Optional eval and checkpointing
+
+    :param make_env_fn: Function that creates a new environment instance.
+    :param regret_nets: List of FlexibleNet instances for each player's regret network.
+    :param policy_nets: List of FlexibleNet instances for each player's policy network.
+    :param regret_mems: List of RegretMemory instances for each player.
+    :param policy_mems: List of PolicyMemory instances for each player.
+    :param device: Device to run training on ("cpu" or "cuda").
+    :param lr_regret: Learning rate for regret networks.
+    :param lr_policy: Learning rate for policy networks.
+    :param weight_decay: Weight decay (L2 regularization) for optimizers.
+    :param logger: Optional RunLogger instance for logging and checkpointing.
+    :param grad_clip: Optional gradient clipping value.
     """
 
     def __init__(
@@ -46,7 +43,7 @@ class DeepCFRTrainer:
         policy_nets: List[FlexibleNet],
         regret_mems: List[RegretMemory],
         policy_mems: List[PolicyMemory],
-        device: str = "cpu",
+        device: str = "cuda",
         lr_regret: float = 1e-3,
         lr_policy: float = 1e-3,
         weight_decay: float = 0.0,
@@ -60,29 +57,31 @@ class DeepCFRTrainer:
         self.policy_mems = policy_mems
         self.device = device
         self.grad_clip = grad_clip
+        self.logger = logger
 
+        # --- n-player inference & checks
+        self.n_players = len(self.regret_nets)
+        assert self.n_players >= 2, "Need at least 2 players."
+        assert len(self.policy_nets) == self.n_players
+        assert len(self.regret_mems) == self.n_players
+        assert len(self.policy_mems) == self.n_players
+
+        # --- opts
         self.regret_opts = [
             optim.Adam(n.parameters(), lr=lr_regret, weight_decay=weight_decay)
-            for n in regret_nets
+            for n in self.regret_nets
         ]
         self.policy_opts = [
             optim.Adam(n.parameters(), lr=lr_policy, weight_decay=weight_decay)
-            for n in policy_nets
+            for n in self.policy_nets
         ]
-
         for n in self.regret_nets + self.policy_nets:
             n.to(self.device)
 
-        self.logger = logger
+        # --- history dict
         self.history: Dict[str, list] = {
-            "regret_loss/seat0": [],
-            "regret_loss/seat1": [],
-            "regret_loss/seat2": [],
-            "regret_loss/seat3": [],
-            "policy_loss/seat0": [],
-            "policy_loss/seat1": [],
-            "policy_loss/seat2": [],
-            "policy_loss/seat3": [],
+            **{f"regret_loss/player{i}": [] for i in range(self.n_players)},
+            **{f"policy_loss/player{i}": [] for i in range(self.n_players)},
             "winrate_vs_random": [],
             "scorediff_vs_random": [],
             "winrate_selfplay": [],
@@ -90,8 +89,8 @@ class DeepCFRTrainer:
         }
         self._global_iter = 0
 
-    # ---------------- data collection ----------------
-    def collect(self, traversals_per_seat: int, seed_offset: int = 0):
+    # ===================== Data collection (external sampling) =====================
+    def collect(self, traversals_per_player: int, seed_offset: int = 0):
         t0 = time.perf_counter()
         traverser = ExternalSamplingTraverser(
             regret_nets=self.regret_nets,
@@ -99,42 +98,40 @@ class DeepCFRTrainer:
             regret_mems=self.regret_mems,
             policy_mems=self.policy_mems,
             device=self.device,
-            strict_illegal=True,
+            strict_illegal=True,  # rely on env illegal-mask repair
         )
 
-        total = 4 * traversals_per_seat
+        total = self.n_players * traversals_per_player
         done = 0
 
-        for seat in range(4):
-            for k in range(traversals_per_seat):
+        for player in range(self.n_players):
+            for k in range(traversals_per_player):
                 env = self.make_env_fn()
-                env.reset(seed=seed_offset + 1000 * seat + k)
-                traverser.traverse(env, target_seat=seat)
+                env.reset(seed=seed_offset + 1000 * player + k)
+                # Traverser must interpret "target_seat=player" as "player index"
+                traverser.traverse(env, target_seat=player)
                 done += 1
 
-                # heartbeat: first, every 10, and last
                 if done == 1 or done % 10 == 0 or done == total:
-                    now = time.perf_counter()
-                    dt = now - t0
-                    rate = done / max(dt, 1e-9)
+                    dt = max(time.perf_counter() - t0, 1e-9)
+                    rate = done / dt
                     eta = (total - done) / max(rate, 1e-9)
                     sys.stdout.write(
                         f"\r[collect] iter={self._global_iter} "
-                        f"seat={seat} k={k + 1}/{traversals_per_seat} "
+                        f"player={player} k={k + 1}/{traversals_per_player} "
                         f"done={done}/{total}  {rate:.1f} trav/s  ETA={eta:.1f}s"
                     )
                     sys.stdout.flush()
 
-        print()  # end progress line
-        t1 = time.perf_counter()
+        print()
         print(
-            f"[collect] iter={self._global_iter} traversals={total} time={t1 - t0:.2f}s  "
-            f"buffers: R={[len(b.buf) for b in self.regret_mems]} "
-            f"P={[len(b.buf) for b in self.policy_mems]}",
+            f"[collect] iter={self._global_iter} traversals={total}  "
+            f"R_buf={[len(b.buf) for b in self.regret_mems]}  "
+            f"P_buf={[len(b.buf) for b in self.policy_mems]}",
             flush=True,
         )
 
-    # ---------------- losses ----------------
+    # ===================== Loss helpers =====================
     @staticmethod
     def _mse_masked(
         pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor
@@ -156,16 +153,10 @@ class DeepCFRTrainer:
         ).clamp_min(1.0)
         return (loss_per * weights).mean()
 
-    # ---------------- single-seat train steps ----------------
-    def train_regret(self, seat: int, batch_size: int, steps: int):
-        """
-        Train the RegretNet for a given seat.
-        :param seat: seat index (0-3)
-        :param batch_size: training batch size
-        :param steps: number of gradient steps to take
-        """
-        net, opt = self.regret_nets[seat], self.regret_opts[seat]
-        mem = self.regret_mems[seat]
+    # ===================== Per-player train steps =====================
+    def train_regret(self, player: int, batch_size: int, steps: int):
+        net, opt = self.regret_nets[player], self.regret_opts[player]
+        mem = self.regret_mems[player]
         net.train()
         last_loss = None
         for _ in range(steps):
@@ -186,34 +177,28 @@ class DeepCFRTrainer:
             opt.step()
             last_loss = loss.item()
         if last_loss is not None:
-            key = f"regret_loss/seat{seat}"
+            key = f"regret_loss/player{player}"
             self.history[key].append(last_loss)
             if self.logger:
                 self.logger.log_scalar(
                     key, last_loss, step=self._global_iter, split="train"
                 )
 
-    def train_policy(self, seat: int, batch_size: int, steps: int):
-        """
-        Train the PolicyNet for a given seat.
-        :param seat: seat index (0-3)
-        :param batch_size: training batch size
-        :param steps: number of gradient steps to take
-        """
-        net, opt = self.policy_nets[seat], self.policy_opts[seat]
-        mem = self.policy_mems[seat]
+    def train_policy(self, player: int, batch_size: int, steps: int):
+        net, opt = self.policy_nets[player], self.policy_opts[player]
+        mem = self.policy_mems[player]
         net.train()
         last_loss = None
         for _ in range(steps):
             if len(mem.buf) == 0:
                 break
             infos, masks, probs, weights = mem.sample(batch_size)
-            infos, masks, probs = (
+            infos, masks, probs, weights = (
                 infos.to(self.device),
                 masks.to(self.device),
                 probs.to(self.device),
+                weights.to(self.device),
             )
-            weights = weights.to(self.device)
             logits = net(infos)
             loss = self._xent_masked_weighted(logits, probs, masks, weights)
             opt.zero_grad(set_to_none=True)
@@ -223,19 +208,15 @@ class DeepCFRTrainer:
             opt.step()
             last_loss = loss.item()
         if last_loss is not None:
-            key = f"policy_loss/seat{seat}"
+            key = f"policy_loss/player{player}"
             self.history[key].append(last_loss)
             if self.logger:
                 self.logger.log_scalar(
                     key, last_loss, step=self._global_iter, split="train"
                 )
 
-    # ---------------- quick eval every iteration ----------------
+    # ===================== Quick eval (n-player aware) =====================
     def _mini_eval(self, n_games_small: int = 30):
-        """
-        Quick evaluation after each iteration to monitor progress.
-        :param n_games_small: number of games to play for quick eval
-        """
         wr, sd = evaluate_vs_random(
             self.policy_nets,
             self.make_env_fn,
@@ -249,88 +230,75 @@ class DeepCFRTrainer:
             device=self.device,
         )
         print(
-            f"[mini_eval] vs_random: winrate={wr:.3f} diff={sd:.3f} | "
-            f"selfplay: winrate={sp_wr:.3f} diff={sp_sd:.3f}",
+            f"[mini_eval] vs_random: winrate={wr:.3f} diff={sd:.3f} | selfplay: winrate={sp_wr:.3f} diff={sp_sd:.3f}",
             flush=True,
         )
 
-    # ---------------- main loop ----------------
+    # ===================== Main loop =====================
     def run(
         self,
         iters: int = 200,
-        traversals_per_seat: int = 512,
+        traversals_per_player: int = 512,
         batch_size: int = 512,
         regret_steps: int = 400,
         policy_steps: int = 400,
         eval_every: int = 0,
         save_every: int = 0,
     ):
-        """
-        Run the Deep CFR training loop.
-        :param iters: number of Deep CFR iterations
-        :param traversals_per_seat: number of external sampling traversals per seat per iteration
-        :param batch_size: training batch size for both regret and policy nets
-        :param regret_steps: number of gradient steps for regret nets per iteration
-        :param policy_steps: number of gradient steps for policy nets per iteration
-        :param eval_every: frequency of full evaluation (0 = no eval)
-        :param save_every: frequency of checkpoint saving (0 = no saving)
-        """
         for it in range(1, iters + 1):
             self._global_iter = it
-            print(f"\n=== Iter {it}/{iters} ===", flush=True)
+            print(f"\n=== Iter {it}/{iters} (players={self.n_players}) ===", flush=True)
             t_iter0 = time.perf_counter()
 
             # 1) collect
-            self.collect(traversals_per_seat, seed_offset=10_000 * it)
+            self.collect(traversals_per_player, seed_offset=10_000 * it)
 
             # 2) train regret nets
             t0 = time.perf_counter()
-            for seat in range(4):
-                self.train_regret(seat, batch_size, regret_steps)
-            t1 = time.perf_counter()
+            for pid in range(self.n_players):
+                self.train_regret(pid, batch_size, regret_steps)
             print(
-                f"[train_regret] seats=4 steps={regret_steps} time={t1 - t0:.2f}s",
+                f"[train_regret] players={self.n_players} steps={regret_steps} time={time.perf_counter() - t0:.2f}s",
                 flush=True,
             )
 
             # 3) train policy nets
             t0 = time.perf_counter()
-            for seat in range(4):
-                self.train_policy(seat, batch_size, policy_steps)
-            t1 = time.perf_counter()
+            for pid in range(self.n_players):
+                self.train_policy(pid, batch_size, policy_steps)
             print(
-                f"[train_policy] seats=4 steps={policy_steps} time={t1 - t0:.2f}s",
+                f"[train_policy] players={self.n_players} steps={policy_steps} time={time.perf_counter() - t0:.2f}s",
                 flush=True,
             )
 
-            # quick diagnostics
+            # Diagnostics
             print(
                 "[loss] regret: "
                 + ", ".join(
                     (
-                        f"s{i}={self.history[f'regret_loss/seat{i}'][-1]:.4f}"
-                        if self.history[f"regret_loss/seat{i}"]
-                        else f"s{i}=None"
+                        f"p{i}={self.history[f'regret_loss/player{i}'][-1]:.4f}"
+                        if self.history[f"regret_loss/player{i}"]
+                        else f"p{i}=None"
                     )
-                    for i in range(4)
+                    for i in range(self.n_players)
                 )
             )
             print(
                 "[loss] policy: "
                 + ", ".join(
                     (
-                        f"s{i}={self.history[f'policy_loss/seat{i}'][-1]:.4f}"
-                        if self.history[f"policy_loss/seat{i}"]
-                        else f"s{i}=None"
+                        f"p{i}={self.history[f'policy_loss/player{i}'][-1]:.4f}"
+                        if self.history[f"policy_loss/player{i}"]
+                        else f"p{i}=None"
                     )
-                    for i in range(4)
+                    for i in range(self.n_players)
                 )
             )
             print(
-                f"[buffers] R={[len(b.buf) for b in self.regret_mems]} P={[len(b.buf) for b in self.policy_mems]}"
+                f"[buffers] R={[len(b.buf) for b in self.regret_mems]}  P={[len(b.buf) for b in self.policy_mems]}"
             )
 
-            # 4) eval: full eval when scheduled, otherwise mini-eval
+            # 4) eval
             if eval_every and it % eval_every == 0:
                 t0 = time.perf_counter()
                 wr, sd = evaluate_vs_random(
@@ -339,11 +307,8 @@ class DeepCFRTrainer:
                 sp_wr, sp_sd = evaluate_selfplay(
                     self.policy_nets, self.make_env_fn, n_games=200, device=self.device
                 )
-                t1 = time.perf_counter()
                 print(
-                    f"[eval] vs_random: winrate={wr:.3f} diff={sd:.3f} | "
-                    f"selfplay: winrate={sp_wr:.3f} diff={sp_sd:.3f} "
-                    f"time={t1 - t0:.2f}s",
+                    f"[eval] vs_random: winrate={wr:.3f} diff={sd:.3f} | selfplay: winrate={sp_wr:.3f} diff={sp_sd:.3f}  time={time.perf_counter() - t0:.2f}s",
                     flush=True,
                 )
                 if self.logger:
@@ -362,7 +327,7 @@ class DeepCFRTrainer:
             else:
                 self._mini_eval(n_games_small=30)
 
-            # 5) save artifacts
+            # 5) save
             if save_every and it % save_every == 0 and self.logger:
                 self.logger.save_checkpoint(
                     self.policy_nets, self.regret_nets, iter_id=it
@@ -370,5 +335,7 @@ class DeepCFRTrainer:
                 self.logger.plot_history(self.history)
                 print("[save] checkpoint + plots", flush=True)
 
-            t_iter1 = time.perf_counter()
-            print(f"[iter_done] total_time={t_iter1 - t_iter0:.2f}s", flush=True)
+            print(
+                f"[iter_done] total_time={time.perf_counter() - t_iter0:.2f}s",
+                flush=True,
+            )

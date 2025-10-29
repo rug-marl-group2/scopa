@@ -4,13 +4,13 @@ Deep CFR training script for 4-player imperfect-information games.
 Example usages:
 
 Test run:
-ipython src/scripts/train_deepcfr.py -- --mode mlp --iters 2 --traversals_per_seat 16 --regret_steps 10 --policy_steps 10
+ipython src/scripts/train_scopa2v2.py -- --mode mlp --iters 2 --traversals_per_player 16 --regret_steps 10 --policy_steps 10
 
 Wide MLP, more traversals, lower LR:
-ipython src/scripts/train_deepcfr.py -- --mode mlp --mlp_hidden 1024,512 --traversals_per_seat 1024 --lr_regret 0.0005 --lr_policy 0.0005 --iters 200
+ipython src/scripts/train_scopa2v2.py -- --mode mlp --mlp_hidden 1024,512 --traversals_per_player 1024 --lr_regret 0.0005 --lr_policy 0.0005 --iters 200
 
 Conv2D + MLP, default params:
-ipython src/scripts/train_deepcfr.py -- --mode conv2d_mlp --iters 100
+ipython src/scripts/train_scopa2v2.py -- --mode conv2d_mlp --iters 100
 """
 
 import argparse
@@ -109,7 +109,7 @@ def build_argparser():
 
     # --- schedule ---
     p.add_argument("--iters", type=int, default=50)
-    p.add_argument("--traversals_per_seat", type=int, default=256)
+    p.add_argument("--traversals_per_player", type=int, default=256)
     p.add_argument("--batch_size", type=int, default=512)
     p.add_argument("--regret_steps", type=int, default=300)
     p.add_argument("--policy_steps", type=int, default=300)
@@ -253,7 +253,7 @@ def main():
 
     trainer.run(
         iters=args.iters,
-        traversals_per_seat=args.traversals_per_seat,
+        traversals_per_player=args.traversals_per_player,
         batch_size=args.batch_size,
         regret_steps=args.regret_steps,
         policy_steps=args.policy_steps,
