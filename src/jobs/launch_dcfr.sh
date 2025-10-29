@@ -17,7 +17,6 @@ echo "Modules loaded."
 source .venv/bin/activate
 echo "Virtual environment activated."
 
-echo "mlp 512, 1024 trav 1024 lr_r 0.0005 lr_p 0.0005 iters 200"
-srun ipython src/scripts/train_scopa1v1.py -- --mode mlp --mlp_hidden 512,1024 --traversals_per_player 1024 --lr_regret 0.0005 --lr_policy 0.0005 --iters 200 --device cuda
+echo "mlp 256,256 trav 512 lr_r 0.0005 lr_p 0.0005 iters 50"
+srun ipython src/scripts/train_scopa1v1.py -- --mode mlp --mlp_hidden 256,256 --traversals_per_player 512 --lr_regret 0.0005 --lr_policy 0.0005 --iters 50 --device cuda
 
-# NOTE: for mlp 1024,512 trav 1024 lr_r 0.0001 lr_p 0.0001 -> iter takes about 4mins
