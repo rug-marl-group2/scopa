@@ -215,13 +215,14 @@ class DeepCFRTrainer:
                     key, last_loss, step=self._global_iter, split="train"
                 )
 
-    # ===================== Quick eval (n-player aware) =====================
+    # ===================== Quick eval =====================
     def _mini_eval(self, n_games_small: int = 30):
+        env = self.make_env_fn()
+        n_agents = len(env.possible_agents)
+        even_nets = [self.policy_nets[i] for i in range(0, n_agents, 2)]
+
         wr, sd = evaluate_vs_random(
-            self.policy_nets,
-            self.make_env_fn,
-            n_games=n_games_small,
-            device=self.device,
+            even_nets, self.make_env_fn, n_games=n_games_small, device=self.device
         )
         sp_wr, sp_sd = evaluate_selfplay(
             self.policy_nets,
@@ -230,7 +231,8 @@ class DeepCFRTrainer:
             device=self.device,
         )
         print(
-            f"[mini_eval] vs_random: winrate={wr:.3f} diff={sd:.3f} | selfplay: winrate={sp_wr:.3f} diff={sp_sd:.3f}",
+            f"[mini_eval] vs_random: winrate={wr:.3f} diff={sd:.3f} | "
+            f"selfplay: winrate={sp_wr:.3f} diff={sp_sd:.3f}",
             flush=True,
         )
 

@@ -127,29 +127,72 @@ class ExternalSamplingTraverser:
         return False
 
     @staticmethod
+    def _player_team_index(target_player: int, n_players: int) -> int:
+        # 1v1: player index == team index
+        if n_players == 2:
+            return target_player
+        # 2v2 Scopa: seats 0,2 -> team 0 ; seats 1,3 -> team 1
+        return target_player % 2
+
+    @staticmethod
     def _terminal_utility_for_player(env, target_player: int) -> float:
-        """
-        Utility mapping at terminal via PettingZoo rewards.
-        Assumes env.possible_agents order aligns with net/memory lists.
-        """
+        # Try PettingZoo rewards if present and non-zero
         if hasattr(env, "rewards") and isinstance(env.rewards, dict):
             agent_name = env.possible_agents[target_player]
-            return float(env.rewards.get(agent_name, 0.0))
+            r = float(env.rewards.get(agent_name, 0.0))
+            # only trust rewards if non-zero (some envs clear them at terminal)
+            if r != 0.0:
+                return r
+
+        # Fallback to env.roundScores() if available
+        try:
+            if hasattr(env, "roundScores"):
+                rs = env.roundScores()
+                if rs:
+                    last = rs[-1]  # tuple of team results (e.g., (+1,-1) or scores)
+                    n_players = len(env.possible_agents)
+                    team_idx = ExternalSamplingTraverser._player_team_index(
+                        target_player, n_players
+                    )
+                    return float(last[team_idx])
+        except Exception:
+            pass
+
+        # Fallback to raw game.evaluate_round() if available
+        try:
+            if hasattr(env, "game") and hasattr(env.game, "evaluate_round"):
+                scores = env.game.evaluate_round()
+                n_players = len(env.possible_agents)
+                team_idx = ExternalSamplingTraverser._player_team_index(
+                    target_player, n_players
+                )
+                return float(scores[team_idx])
+        except Exception:
+            pass
+
+        # Nothing found
         return 0.0
 
     # ---------------------------------------------------------------------
     # Rollout (ALL players sample from regret-matching σ)
     # ---------------------------------------------------------------------
 
-    def _sigma_from_regret(self, player_idx: int, obs_flat: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    def _sigma_from_regret(
+        self, player_idx: int, obs_flat: np.ndarray, mask: np.ndarray
+    ) -> np.ndarray:
         """Compute regret-matching policy σ for a given player, observation, and mask."""
         with torch.no_grad():
             x = torch.from_numpy(obs_flat[None, :]).float().to(self.device)
             adv_pred = self.regret_nets[player_idx](x).squeeze(0)
-            probs = positive_regret_policy(
-                adv_pred[None, :],
-                torch.from_numpy(mask[None, :]).float().to(self.device),
-            ).squeeze(0).cpu().numpy()
+            probs = (
+                positive_regret_policy(
+                    adv_pred[None, :],
+                    torch.from_numpy(mask[None, :]).float().to(self.device),
+                )
+                .squeeze(0)
+                .cpu()
+                .numpy()
+            )
         return probs
 
     def _rollout_to_terminal(self, env) -> float:
