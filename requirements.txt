@@ -1,11 +1,9 @@
 pettingzoo
 gymnasium
 numpy
-tlogger
 ipython
 tensorboardX
 tensorboard
 tqdm
 jax
 matplotlib
-torch
