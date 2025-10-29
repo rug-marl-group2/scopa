@@ -320,8 +320,14 @@ class MaScopaEnv(AECEnv):
         self._action_spaces = {
             agent: spaces.Discrete(40) for agent in self.possible_agents
         }
+        # OBS CHANNELS (5 x 40):
+        # 0: own hand
+        # 1: table
+        # 2: captures (own + friend)
+        # 3: friend history
+        # 4: own history
         self._observation_spaces = {
-            agent: spaces.Box(0, 1, shape=(4, 40), dtype=np.float32)
+            agent: spaces.Box(0, 1, shape=(5, 40), dtype=np.float32)
             for agent in self.possible_agents
         }
 
@@ -365,7 +371,7 @@ class MaScopaEnv(AECEnv):
         player = self.game.players[player_index]
         friend = self.game.players[friend_index]
 
-        state = np.zeros((4, 40), dtype=np.float32)
+        state = np.zeros((5, 40), dtype=np.float32)
         off = self._suit_offset
 
         for card in player.hand:
@@ -378,6 +384,8 @@ class MaScopaEnv(AECEnv):
             state[2][(card.rank - 1) + off[card.suit]] = 1.0
         for card in friend.history:
             state[3][(card.rank - 1) + off[card.suit]] = 1.0
+        for card in player.history:
+            state[4][(card.rank - 1) + off[card.suit]] = 1.0
 
         return state
 

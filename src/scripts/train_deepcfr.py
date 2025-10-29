@@ -10,7 +10,7 @@ Wide MLP, more traversals, lower LR:
 ipython src/scripts/train_deepcfr.py -- --mode mlp --mlp_hidden 1024,512 --traversals_per_seat 1024 --lr_regret 0.0005 --lr_policy 0.0005 --iters 200
 
 Conv2D + MLP, default params:
-ipython src/scripts/train_deepcfr.py -- --mode conv2d_mlp --conv_input_C 1 --conv_input_H 4 --conv_input_W 40 --iters 100
+ipython src/scripts/train_deepcfr.py -- --mode conv2d_mlp --iters 100
 """
 
 import argparse
@@ -45,7 +45,7 @@ def parse_float_list(s: str):
     :param s: Comma-separated string, e.g., "0.1,0.01"
     :return: List of floats, e.g., [0.1, 0.01]
     """
-    # "0.1,0.01" -> [0.1, 0.01]; "" or None -> []
+
     if s is None or s == "":
         return []
     return [float(x) for x in s.split(",") if x.strip() != ""]
@@ -66,7 +66,7 @@ def build_argparser():
     p.add_argument("--mode", type=str, default="mlp", choices=["mlp", "conv2d_mlp"])
 
     # --- MLP config ---
-    p.add_argument("--in_dim", type=int, default=160, help="Flattened obs size (4x40)")
+    p.add_argument("--in_dim", type=int, default=200, help="Flattened obs size (4x40)")
     p.add_argument("--mlp_hidden", type=parse_int_list, default="512,256")
     p.add_argument(
         "--mlp_act",
@@ -82,7 +82,7 @@ def build_argparser():
 
     # --- Conv config (if conv2d_mlp) ---
     p.add_argument("--conv_input_C", type=int, default=1)
-    p.add_argument("--conv_input_H", type=int, default=4)
+    p.add_argument("--conv_input_H", type=int, default=5)
     p.add_argument("--conv_input_W", type=int, default=40)
     p.add_argument("--conv_channels", type=parse_int_list, default="32,64")
     p.add_argument("--conv_kernels", type=parse_int_list, default="3,3")

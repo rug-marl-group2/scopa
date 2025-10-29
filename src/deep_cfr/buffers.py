@@ -91,7 +91,7 @@ class PolicyMemory:
     Stores tuples: (info_tensor, legal_mask, target_probs, weight)
       - target_probs: torch.float (A,)  # σ target at this infoset
       - weight      : float             # reach weight (for weighted CE)
-    
+
     :param capacity: maximum number of items to store
     :param device: torch device for sampling
     :param seed: optional random seed for reproducibility
