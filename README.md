@@ -74,3 +74,34 @@ Notes:
 - The JAX env uses a fixed 6x40 observation layout compatible with the original code.
 - Capture logic and scoring are implemented with JAX control flow and array ops for `jit` and `vmap`.
 - For “pure JAX” CFR/Deep CFR, plug a JAX/Flax policy in place of `uniform_policy` and run batched `play_rounds_batched` to collect data and compute losses.
+
+## Neural regret training pipeline
+
+The repository ships with a neural-network based regret regressor that learns a policy using Monte Carlo rollouts to bootstrap regret targets.  The trainer shares the same logging and preview utilities as the CFR script and can be launched directly from the command line.
+
+### Quick start
+
+```bash
+python src/train_nn_regret.py \
+  --iters 50 \
+  --deals_per_iter 4 \
+  --updates_per_iter 2 \
+  --layers 128,128 \
+  --learning_rate 5e-4 \
+  --mc_rollouts 2 \
+  --bootstrap_mc
+```
+
+Key CLI flags:
+
+| Flag | Description |
+| ---- | ----------- |
+| `--layers` | Hidden layer sizes for the regret network (comma separated). |
+| `--learning_rate` / `--momentum` / `--weight_decay` | Optimizer hyperparameters. |
+| `--buffer_capacity` / `--batch_size` / `--updates_per_iter` | Replay buffer size and training cadence. |
+| `--mc_rollouts` | Number of Monte Carlo samples per action when estimating regret targets. |
+| `--bootstrap_mc` | Enable Monte Carlo bootstrapping for regret targets (disable for purely supervised updates). |
+| `--target_update` | Frequency for synchronising target parameters when using delayed updates. |
+| `--preview_policy` | Render a few games with the learned strategy after training (uses `TLogger` previews). |
+
+Checkpoints containing the learned parameters and averaged strategy live under `runs/nn_regret/<timestamp>/checkpoints/` by default.

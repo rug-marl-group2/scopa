@@ -15,11 +15,13 @@ from tlogger import TLogger
 from env import env as make_env
 from cfr_jax import CFRTrainer
 from ctde_trainer import CTDETrainer
+from nn_regret_policy import load_policy as load_nn_regret_policy
 
 
 def load_any_policy(checkpoint: str, seed: int):
-    """Attempt to load a policy checkpoint with CFR fallback before CTDE."""
+    """Attempt to load a policy checkpoint (NN regret -> CFR -> CTDE)."""
     load_attempts = [
+        ("NN regret policy", lambda: load_nn_regret_policy(checkpoint, seed=seed)),
         ("CFR average policy", lambda: CFRTrainer.load_avg_policy(checkpoint, seed=seed)),
         ("CTDE actor", lambda: CTDETrainer.load_policy(checkpoint, seed=seed)),
     ]
@@ -123,22 +125,37 @@ class GameManager:
 
     def _select_action(self, seat: int, obs: np.ndarray, mask: np.ndarray) -> int:
         legal = [i for i, m in enumerate(mask) if m == 1]
+        if not legal:
+            return 0
         team = seat % 2
         actor = self.actors.get(team)
         if self.mode == 'vs_random' and team == 1 and actor is None:
             return int(random.choice(legal))
         if actor is None:
             return int(random.choice(legal))
-        if hasattr(actor, 'act_with_mask'):
+        action = None
+        if hasattr(actor, 'act_with_env'):
             try:
-                a = int(actor.act_with_mask(seat, obs, mask))
+                candidate = actor.act_with_env(self.env, seat, obs, mask)
+                action = int(candidate)
             except TypeError:
-                a = int(actor.act_from_obs(seat, obs))
-        else:
-            a = int(actor.act_from_obs(seat, obs))
-        if mask[a] == 0:
+                action = None
+            except Exception as exc:
+                print(f"act_with_env fallback: {exc}")
+                action = None
+        if action is None:
+            if hasattr(actor, 'act_with_mask'):
+                try:
+                    action = int(actor.act_with_mask(seat, obs, mask))
+                except TypeError:
+                    action = int(actor.act_from_obs(seat, obs))
+            else:
+                action = int(actor.act_from_obs(seat, obs))
+        if action is None:
+            return int(random.choice(legal))
+        if action < 0 or action >= len(mask) or mask[action] == 0:
             return int(legal[0])
-        return a
+        return action
 
     def step(self) -> None:
         agent = self.env.agent_selection

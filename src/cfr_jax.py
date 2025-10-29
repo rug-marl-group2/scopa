@@ -1261,6 +1261,75 @@ class CFRTrainer:
             probs = legal / float(count)
         return probs
 
+    def _policy_value_recursive(
+        self,
+        st: NState,
+        team_override: Optional[int],
+        policy_map: Optional[Dict[Tuple[int, bytes], np.ndarray]],
+        use_avg_policy: bool,
+    ) -> float:
+        """Evaluate a policy assuming optional best-response override for one team."""
+
+        if np_is_terminal(st):
+            return float(self._evaluate_utility(st, seat=0))
+
+        seat = int(st.cur_player)
+        team = int(TEAM_INDEX[seat])
+        obs = np_build_obs(st, seat)
+        legal_mask = (obs[0] > 0).astype(np.int32)
+        legal_actions = np.nonzero(legal_mask)[0]
+        if legal_actions.size == 0:
+            return float(self._evaluate_utility(st, seat=0))
+
+        subset_masks = self._subset_sum_masks_cached(st.table, legal_actions)
+
+        if team_override is not None and team == int(team_override):
+            best_val = float("-inf") if team_override == 0 else float("inf")
+            for action in legal_actions:
+                diff = self._apply_action_inplace(st, int(action), subset_mask=subset_masks.get(int(action)))
+                val = self._policy_value_recursive(st, team_override, policy_map, use_avg_policy)
+                self._undo_action(st, diff)
+                if team_override == 0:
+                    if val > best_val:
+                        best_val = val
+                else:
+                    if val < best_val:
+                        best_val = val
+            if not np.isfinite(best_val):
+                best_val = 0.0
+            return float(best_val)
+
+        probs = self._policy_action_probs(seat, obs, policy_map, use_avg_policy)
+        total = 0.0
+        for action in legal_actions:
+            prob = float(probs[action])
+            if prob <= 0.0:
+                continue
+            diff = self._apply_action_inplace(st, int(action), subset_mask=subset_masks.get(int(action)))
+            val = self._policy_value_recursive(st, team_override, policy_map, use_avg_policy)
+            self._undo_action(st, diff)
+            total += prob * float(val)
+        return float(total)
+
+    def _policy_value_triplet(
+        self,
+        st: NState,
+        policy_map: Optional[Dict[Tuple[int, bytes], np.ndarray]],
+        use_avg_policy: bool,
+    ) -> Tuple[float, float, float]:
+        """Return (policy value, team0 best-response, team1 best-response)."""
+
+        base_state = np_clone_state(st)
+        value = self._policy_value_recursive(base_state, None, policy_map, use_avg_policy)
+
+        br0_state = np_clone_state(st)
+        br0 = self._policy_value_recursive(br0_state, 0, policy_map, use_avg_policy)
+
+        br1_state = np_clone_state(st)
+        br1 = self._policy_value_recursive(br1_state, 1, policy_map, use_avg_policy)
+
+        return float(value), float(br0), float(br1)
+
     def _simulate_policy_episode(self, st: NState,
                                   policy_map: Optional[Dict[Tuple[int, bytes], np.ndarray]],
                                   use_avg_policy: bool,
