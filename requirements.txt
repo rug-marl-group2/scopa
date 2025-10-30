@@ -4,6 +4,5 @@ numpy
 tlogger
 ipython
 tensorboardX
-tensorboard
 tqdm
 jax

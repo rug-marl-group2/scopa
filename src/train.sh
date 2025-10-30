@@ -1,33 +1,73 @@
 #!/bin/bash
-#SBATCH --mem=32GB
-#SBATCH --time=20:55:55
-#SBATCH --job-name=acfrlesssup
-#SBATCH --partition=gpu
-#SBATCH --gres=gpu:a100:1
-#SBATCH --nodes=1
-#SBATCH --output=scopa/logs/output.%j.log  # Output log
-#SBATCH --error=scopa/logs/error.%j.log   # Error log
+#SBATCH --job-name=training_pipeline
+#SBATCH --time=24:00:00
+#SBATCH --mem=24GB
+#SBATCH --gres=gpu:1                  # any GPU
+#SBATCH --output=logs/%x_%j.out
+#SBATCH --error=logs/%x_%j.err
+
+set -euo pipefail
+
 module --force purge
-module --ignore_cache load "CUDA/12.4.0"
-source /home1/s6133800/miniconda3/etc/profile.d/conda.sh
-conda activate scopa_jax
 
-ALGO="cfr"
-if [ "$#" -gt 0 ]; then
-    case "$1" in
-        ctde|CTDE)
-            ALGO="ctde"
-            shift
-            ;;
-        cfr|CFR)
-            shift
-            ;;
-    esac
+# --- Pick an available Python module automatically (edit list if needed) ---
+for PYMOD in \
+  Python/3.11.5-GCCcore-13.2.0 \
+  Python/3.10.12-GCCcore-12.3.0 \
+  Python/3.9.18-GCCcore-12.2.0
+do
+  if module -t avail "$PYMOD" >/dev/null 2>&1; then
+    module load "$PYMOD"
+    echo "[INFO] Loaded $PYMOD"
+    break
+  fi
+done
+
+# If none of the above loaded, fall back to system python (warn)
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "[ERROR] No usable python found via modules or system PATH." >&2
+  exit 1
 fi
 
-if [ "$ALGO" = "ctde" ]; then
-    srun python scopa/src/train_ctde.py --eval_vs_random "$@"
+# --- Paths (edit these two to your project) ---
+PROJECT_DIR="$HOME/HandwrittenDocAnalysis"
+VENV_DIR="$HOME/envs/myenv"          # reuse your old env path
+
+mkdir -p "$(dirname "${SLURM_STDOUT:-logs/dummy.out}")" logs
+cd "$PROJECT_DIR"
+
+# --- Create venv if missing & install requirements ---
+if [ ! -d "$VENV_DIR" ]; then
+  echo "[INFO] Creating venv at $VENV_DIR"
+  python3 -m venv "$VENV_DIR"
+  source "$VENV_DIR/bin/activate"
+  python -m pip install --upgrade pip
+  if [ -f requirements.txt ]; then
+    python -m pip install -r requirements.txt
+  else
+    echo "[WARN] requirements.txt not found; skipping installs."
+  fi
 else
-    srun python scopa/src/train_cfr.py --iters 800 --log_every 5 --eval_every 25 --eval_eps 32 --eval_policy avg --save_kind full --max_infosets 400000 --batch_size 16 "$@"
+  echo "[INFO] Using existing venv at $VENV_DIR"
+  source "$VENV_DIR/bin/activate"
 fi
 
+# Optional: print versions
+which python
+python --version
+pip --version
+
+# --- CUDA/PyTorch memory tweak (keep yours) ---
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+# Run the training script
+srun python scopa/src/train_cfr.py \
+  --iters 1000 \
+  --log_every 10 \
+  --eval_every 100 \
+  --eval_eps 32 \
+  --eval_policy avg \
+  --save_kind avg \
+  --branch_topk 3 \
+  --max_infosets 300000 \
+  --obs_key_mode compact

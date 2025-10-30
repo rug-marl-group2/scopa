@@ -4,7 +4,31 @@ using a JAX-based implementation. It logs training metrics, optionally evaluates
 the resulting policy, and previews gameplay using both random and learned strategies.        
 
 Example Usage:
-    python scopa/src/train_cfr.py --iters 10 --log_every 1 --exploit_every 2 --exploit_eps 16 --exploit_policy avg --eval_every 4 --eval_eps 64 --eval_policy current --save_kind full --max_infosets 250000
+    python src/train_cfr.py --iters 1500 --log_every 10 --eval_every 50 --eval_eps 32 --eval_policy current --save_kind full --max_infosets 250000
+    #python src/train_cfr.py --iters 2500 --log_every 10 --eval_every 100 --eval_eps 64 --eval_policy current --save_kind current --branch_topk 1 --max_infosets 250000
+
+Sanity Check usage:
+    python src/train_cfr.py --iters 200 --batch_size 2 --eval_every 0 \
+    --branch_topk 3 --max_branch_actions 4 --pw_alpha 0.3 --pw_tail 2 \
+    --prune_threshold -0.05 --prune_warmup 16 --prune_reactivation 8 \
+    --subset_cache_size 2048 --rollout_depth 12 --rollout_samples 4 \
+    --obs_key_mode compact --max_infosets 20000 --table_dtype float16
+
+Laptop train usage:
+    python src/train_cfr.py --iters 5000 --batch_size 8 --eval_every 500 --eval_eps 64 --eval_policy avg \
+    --branch_topk 5 --max_branch_actions 6 --pw_alpha 0.3 --pw_tail 3 \
+    --prune_threshold -0.02 --prune_warmup 32 --prune_reactivation 8 \
+    --subset_cache_size 8192 --rollout_depth 14 --rollout_samples 8 \
+    --obs_key_mode full --max_infosets 250000 --table_dtype float16 --save_kind avg
+
+Stronger baseline usage:
+    python src/train_cfr.py --iters 20000 --batch_size 32 --eval_every 1000 --eval_eps 128 --eval_policy avg \
+    --branch_topk 6 --max_branch_actions 8 --pw_alpha 0.3 --pw_tail 4 \
+    --prune_threshold 0.0 --prune_warmup 48 --prune_reactivation 16 \
+    --subset_cache_size 32768 --rollout_depth 16 --rollout_samples 12 \
+    --obs_key_mode full --max_infosets 1000000 --table_dtype float16 --save_kind full
+
+
 """
 
 
@@ -20,9 +44,11 @@ from typing import Optional
 
 from tlogger import TLogger
 import env as env_mod
-from env import env as make_env
+from env import MaScopaEnv
 from cfr_jax import CFRTrainer
 
+def make_env(tlog, render_mode=None):
+    return MaScopaEnv(render_mode=render_mode, tlogger=tlog)
 
 def card_str_list(cards):
     return [str(c) for c in cards]
