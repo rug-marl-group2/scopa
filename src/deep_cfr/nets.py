@@ -82,37 +82,23 @@ def masked_softmax(
 ) -> torch.Tensor:
     """
     Softmax over legal actions only. logits, mask: (B, A). mask in {0,1}.
-
-    :param logits: torch.Tensor logits (B, A)
-    :param mask: torch.Tensor legal action mask (B, A)
-    :param eps: small value to avoid division by zero
-    :return: torch.Tensor probabilities (B, A)
     """
-    very_neg = torch.finfo(logits.dtype).min / 2
+    very_neg = torch.tensor(-1e9, dtype=logits.dtype, device=logits.device)
     masked = torch.where(mask > 0, logits, very_neg)
     probs = torch.softmax(masked, dim=-1)
-    # Renormalize in case mask is all zeros (fallback to uniform)
     z = (probs * mask).sum(dim=-1, keepdim=True).clamp_min(eps)
     return (probs * mask) / z
 
 
 def positive_regret_policy(
-    advantages: torch.Tensor, mask: torch.Tensor, eps: float = 1e-8
+    adv: torch.Tensor, mask: torch.Tensor, eps: float = 1e-8
 ) -> torch.Tensor:
     """
-    σ(a) ∝ max(0, A(a)) over legal actions (uniform if all non-positive).
-    advantages, mask: (B, A)
-
-    :param advantages: torch.Tensor advantages/regrets (B, A)
-    :param mask: torch.Tensor legal action mask (B, A)
-    :param eps: small value to avoid division by zero
-    :return: torch.Tensor probabilities (B, A)
+    Convert regrets to a normalized policy using regret matching.
     """
-    pos = torch.clamp(advantages, min=0.0) * mask
-    z = pos.sum(dim=-1, keepdim=True)
-    # If all <=0, use uniform over legal actions
-    uniform = mask / mask.sum(dim=-1, keepdim=True).clamp_min(eps)
-    return torch.where(z > eps, pos / z, uniform)
+    pos = torch.relu(adv) * mask
+    z = pos.sum(dim=-1, keepdim=True).clamp_min(eps)
+    return pos / z
 
 
 class ConvBlock2D(nn.Module):

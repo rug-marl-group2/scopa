@@ -1,5 +1,5 @@
 """
-Deep CFR training script for 4-player imperfect-information games.
+Deep CFR training script for 4-player imperfect-information card game Scopone Scientifico.
 
 Example usages:
 
@@ -66,7 +66,7 @@ def build_argparser():
     p.add_argument("--mode", type=str, default="mlp", choices=["mlp", "conv2d_mlp"])
 
     # --- MLP config ---
-    p.add_argument("--in_dim", type=int, default=200, help="Flattened obs size (4x40)")
+    p.add_argument("--in_dim", type=int, default=200, help="Flattened obs size (5x40)")
     p.add_argument("--mlp_hidden", type=parse_int_list, default="512,256")
     p.add_argument(
         "--mlp_act",

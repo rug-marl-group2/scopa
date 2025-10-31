@@ -5,11 +5,15 @@ import sys, time
 from typing import Callable, Dict, List, Optional
 
 import torch
-import torch.nn as nn
+import numpy as np
 import torch.optim as optim
 
 from src.deep_cfr.buffers import PolicyMemory, RegretMemory
-from src.deep_cfr.evaluator import evaluate_selfplay, evaluate_vs_random
+from src.deep_cfr.evaluator import (
+    evaluate_selfplay,
+    evaluate_vs_random,
+    evaluate_vs_random_one_net,
+)
 from src.deep_cfr.loggers import RunLogger
 from src.deep_cfr.nets import FlexibleNet, masked_softmax
 from src.deep_cfr.traverser import ExternalSamplingTraverser
@@ -18,22 +22,6 @@ from src.deep_cfr.traverser import ExternalSamplingTraverser
 class DeepCFRTrainer:
     """
     Deep CFR trainer (n-player, imperfect-information).
-
-    - Data collection via ExternalSamplingTraverser (external sampling CFR)
-    - Training regret/policy heads per player
-    - Optional eval and checkpointing
-
-    :param make_env_fn: Function that creates a new environment instance.
-    :param regret_nets: List of FlexibleNet instances for each player's regret network.
-    :param policy_nets: List of FlexibleNet instances for each player's policy network.
-    :param regret_mems: List of RegretMemory instances for each player.
-    :param policy_mems: List of PolicyMemory instances for each player.
-    :param device: Device to run training on ("cpu" or "cuda").
-    :param lr_regret: Learning rate for regret networks.
-    :param lr_policy: Learning rate for policy networks.
-    :param weight_decay: Weight decay (L2 regularization) for optimizers.
-    :param logger: Optional RunLogger instance for logging and checkpointing.
-    :param grad_clip: Optional gradient clipping value.
     """
 
     def __init__(
@@ -108,8 +96,11 @@ class DeepCFRTrainer:
             for k in range(traversals_per_player):
                 env = self.make_env_fn()
                 env.reset(seed=seed_offset + 1000 * player + k)
-                # Traverser must interpret "target_seat=player" as "player index"
-                traverser.traverse(env, target_seat=player)
+                traverser.traverse(
+                    env,
+                    target_seat=player,
+                    reach=np.ones(self.n_players, dtype=np.float64),
+                )
                 done += 1
 
                 if done == 1 or done % 10 == 0 or done == total:
@@ -215,15 +206,32 @@ class DeepCFRTrainer:
                     key, last_loss, step=self._global_iter, split="train"
                 )
 
-    # ===================== Quick eval =====================
-    def _mini_eval(self, n_games_small: int = 30):
+    # ===================== Eval routing helpers =====================
+
+    def _eval_vs_random_auto(self, n_games: int) -> tuple[float, float]:
+        """
+        Sensible default:
+        - If 1v1: evaluate a SINGLE net vs random with seat-averaging (seat bias removed).
+        - If n_agents>2: evaluate the EVEN seats' nets vs random opponents.
+        """
         env = self.make_env_fn()
         n_agents = len(env.possible_agents)
-        even_nets = [self.policy_nets[i] for i in range(0, n_agents, 2)]
+        if n_agents == 2:
+            return evaluate_vs_random_one_net(
+                self.policy_nets[0],
+                self.make_env_fn,
+                n_games=n_games,
+                device=self.device,
+                seat_average=True,
+            )
+        else:
+            even_nets = [self.policy_nets[i] for i in range(0, n_agents, 2)]
+            return evaluate_vs_random(
+                even_nets, self.make_env_fn, n_games=n_games, device=self.device
+            )
 
-        wr, sd = evaluate_vs_random(
-            even_nets, self.make_env_fn, n_games=n_games_small, device=self.device
-        )
+    def _mini_eval(self, n_games_small: int = 30):
+        wr, sd = self._eval_vs_random_auto(n_games_small)
         sp_wr, sp_sd = evaluate_selfplay(
             self.policy_nets,
             self.make_env_fn,
@@ -303,9 +311,7 @@ class DeepCFRTrainer:
             # 4) eval
             if eval_every and it % eval_every == 0:
                 t0 = time.perf_counter()
-                wr, sd = evaluate_vs_random(
-                    self.policy_nets, self.make_env_fn, n_games=200, device=self.device
-                )
+                wr, sd = self._eval_vs_random_auto(n_games=200)
                 sp_wr, sp_sd = evaluate_selfplay(
                     self.policy_nets, self.make_env_fn, n_games=200, device=self.device
                 )

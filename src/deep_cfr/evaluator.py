@@ -5,16 +5,12 @@ Deep CFR evaluators (n-player, PettingZoo-compatible).
 - Generic obs flatten: (H,W,...) -> 1D
 - Legal mask from infos['action_mask'] (fallback to env.get_action_mask)
 - No dependency on agent name formats like "player_0"
-- Uses cumulative PettingZoo rewards; team metric = evens vs odds
+- Uses terminal round score if the env exposes it; otherwise sums cumulative rewards.
 
 APIs:
 - evaluate_selfplay(policy_nets, make_env, ...)
-- evaluate_vs_random(policy_nets, make_env, ...)
-
-Mapping for evaluate_vs_random:
-- If len(nets) == num_agents: everyone uses its net (degenerates to self-play).
-- If len(nets) == 1: the single net controls seat 0; others random.
-- If len(nets) == ceil(num_agents/2): nets control EVEN seats (0,2,...) in order; ODDS are random.
+- evaluate_vs_random(policy_nets, make_env, ..., allow_selfplay_equivalence=False)
+- evaluate_vs_random_one_net(policy_net, make_env, ..., seat_average=True)
 """
 
 from __future__ import annotations
@@ -95,7 +91,7 @@ def _final_team_scores(env) -> Optional[Tuple[float, float]]:
     Try to read terminal *round* scores from the env, if available.
     Returns (evens_score, odds_score) or None if not available.
     """
-    # 1) Scopa envs may expose roundScores(): list of (team_even, team_odd)
+    # 1) Scopa-like envs: roundScores() -> list[(team_even, team_odd), ...]
     try:
         if hasattr(env, "roundScores") and callable(env.roundScores):
             scores_hist = env.roundScores()
@@ -106,7 +102,7 @@ def _final_team_scores(env) -> Optional[Tuple[float, float]]:
     except Exception:
         pass
 
-    # 2) Some envs expose game.evaluate_round() → [team0, team1]
+    # 2) Raw game hook: game.evaluate_round() -> [team0, team1]
     try:
         if hasattr(env, "game") and hasattr(env.game, "evaluate_round"):
             v = env.game.evaluate_round()
@@ -191,15 +187,16 @@ def evaluate_vs_random(
     n_games: int = 50,
     device: str = "cpu",
     seed_offset: int = 0,
+    allow_selfplay_equivalence: bool = False,
 ) -> Tuple[float, float]:
     """
     Evaluate vs random opponents. Seat mapping rules:
 
     - If len(nets) == num_agents: everyone uses their net (degenerates to self-play).
-    - If len(nets) == 1: net controls seat 0, others random.  (Use this for 1v1 vs-random.)
+      This raises unless allow_selfplay_equivalence=True.
+    - If len(nets) == 1: net controls seat 0, others random. (For 1v1 experiments.)
     - If len(nets) == ceil(num_agents/2): nets control EVEN seats (0,2,...) in order; ODDS are random.
       (Use this for 2v2 with nets for seats 0 and 2.)
-    - Otherwise: raise an error with guidance.
 
     Returns (winrate_evens, avg_score_diff = evens - odds).
     """
@@ -213,6 +210,13 @@ def evaluate_vs_random(
 
         n_agents = len(env.possible_agents)
         n_nets = len(policy_nets)
+
+        if n_nets == n_agents and not allow_selfplay_equivalence:
+            raise ValueError(
+                "evaluate_vs_random received one net per agent; this degenerates to self-play.\n"
+                "Either pass a single net (seat 0) for 1v1, half the agents (even seats) for 2v2, "
+                "or set allow_selfplay_equivalence=True if you really want this."
+            )
 
         # agent_index -> net_index (int) or None (random)
         control: dict[int, Optional[int]] = {}
@@ -266,3 +270,116 @@ def evaluate_vs_random(
     winrate = wins / max(1, n_games)
     score_diff = float(np.mean(diffs)) if diffs else 0.0
     return winrate, score_diff
+
+
+def evaluate_vs_random_one_net(
+    policy_net: "FlexibleNet",
+    make_env: Callable[[], Any],
+    n_games: int = 50,
+    device: str = "cpu",
+    seed_offset: int = 0,
+    seat_average: bool = True,
+) -> Tuple[float, float]:
+    """
+    Evaluate a single net vs random opponents.
+
+    - If seat_average=True and the game is 1v1, we run half the games with the net in seat 0,
+      half in seat 1, then average the two results. This removes seat bias.
+    - For n_agents > 2, the net always controls seat 0 (even team).
+
+    Returns (winrate_evens, avg_score_diff = evens - odds).
+    """
+    rng = np.random.RandomState(seed_offset + 54321)
+
+    def _run_with_seat0(g0: int) -> Tuple[float, float]:
+        wins = 0.0
+        diffs: List[float] = []
+        for g in range(g0, g0 + n_games):
+            env = make_env()
+            env.reset(seed=seed_offset + 20_000 + g)
+
+            n_agents = len(env.possible_agents)
+            control: dict[int, Optional[int]] = {}
+            # seat 0 is controlled by net; others random
+            control[0] = 0
+            for i in range(1, n_agents):
+                control[i] = None
+
+            cum = {a: 0.0 for a in env.possible_agents}
+
+            while not all(env.terminations.values()) and not all(
+                env.truncations.values()
+            ):
+                agent = env.agent_selection
+                idx = env.possible_agents.index(agent)
+                obs_flat = _flatten_obs(env.observe(agent))
+                mask = _legal_mask(env, agent)
+
+                if control.get(idx, None) is None:
+                    a = _sample_random(mask, rng)
+                else:
+                    a = _sample_from_policy(policy_net, device, obs_flat, mask, rng)
+
+                env.step(a)
+                _accumulate_rewards(env, cum)
+
+            term = _final_team_scores(env)
+            if term is not None:
+                evens, odds = term
+            else:
+                evens, odds = _team_scores_from_cum(env, cum)
+
+            diffs.append(evens - odds)
+            wins += 1.0 if (evens - odds) > 0 else (0.5 if (evens - odds) == 0 else 0.0)
+
+        return wins / max(1, n_games), float(np.mean(diffs)) if diffs else 0.0
+
+    # If not seat averaging or not 1v1, just run seat0 mode.
+    env_tmp = make_env()
+    if (not seat_average) or (len(env_tmp.possible_agents) != 2):
+        return _run_with_seat0(0)
+
+    # 1v1 + seat averaging: run half games as seat 0, half mirrored as seat 1
+    wr0, sd0 = _run_with_seat0(0)
+
+    # Mirror by swapping seat assignment: to simulate seat 1 control, we’ll
+    # wrap the action selection so that when idx==1 we use the net, else random.
+    def _run_with_seat1(g0: int) -> Tuple[float, float]:
+        wins = 0.0
+        diffs: List[float] = []
+        for g in range(g0, g0 + n_games):
+            env = make_env()
+            env.reset(seed=seed_offset + 30_000 + g)
+
+            cum = {a: 0.0 for a in env.possible_agents}
+
+            while not all(env.terminations.values()) and not all(
+                env.truncations.values()
+            ):
+                agent = env.agent_selection
+                idx = env.possible_agents.index(agent)
+                obs_flat = _flatten_obs(env.observe(agent))
+                mask = _legal_mask(env, agent)
+
+                if idx == 1:  # seat 1 controlled by our net
+                    a = _sample_from_policy(policy_net, device, obs_flat, mask, rng)
+                else:
+                    a = _sample_random(mask, rng)
+
+                env.step(a)
+                _accumulate_rewards(env, cum)
+
+            term = _final_team_scores(env)
+            if term is not None:
+                evens, odds = term
+            else:
+                evens, odds = _team_scores_from_cum(env, cum)
+
+            diffs.append(evens - odds)
+            wins += 1.0 if (evens - odds) > 0 else (0.5 if (evens - odds) == 0 else 0.0)
+
+        return wins / max(1, n_games), float(np.mean(diffs)) if diffs else 0.0
+
+    wr1, sd1 = _run_with_seat1(10_000)
+    # Average both seat roles
+    return (wr0 + wr1) / 2.0, (sd0 + sd1) / 2.0

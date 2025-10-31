@@ -1,15 +1,8 @@
 """
-Deep CFR training script for 2-player abstracted Scopone Scientifico.
+Train Deep CFR on Kuhn Poker.
+
 Example usages:
-
-Test run:
-ipython src/scripts/train_scopa1v1.py -- --mode mlp --iters 2 --traversals_per_player 16 --regret_steps 10 --policy_steps 10
-
-Wide MLP, more traversals, lower LR:
-ipython src/scripts/train_scopa1v1.py -- --mode mlp --mlp_hidden 1024,512 --traversals_per_player 1024 --lr_regret 0.0005 --lr_policy 0.0005 --iters 200
-
-Conv2D + MLP, default params:
-ipython src/scripts/train_scopa1v1.py -- --mode conv2d_mlp --iters 100
+ipython src/scripts/train_kuhn.py -- --mode mlp --iters 200 --traversals_per_player 512 --lr_regret 0.001 --lr_policy 0.001 --batch_size 32
 """
 
 import argparse
@@ -17,7 +10,7 @@ import argparse
 import numpy as np
 import torch
 
-import src.games.scopa_1v1_wrapper as env_mod_1v1
+import src.games.kuhn as env_mod_kuhn
 from src.deep_cfr.buffers import PolicyMemory, RegretMemory
 from src.deep_cfr.loggers import RunLogger
 from src.deep_cfr.nets import FlexibleNet
@@ -53,7 +46,7 @@ def parse_float_list(s: str):
 def build_argparser():
     """Build the argument parser for Deep CFR training."""
 
-    p = argparse.ArgumentParser("Deep CFR trainer (Scopa/2v2)")
+    p = argparse.ArgumentParser("Deep CFR trainer (Kuhn Poker)")
 
     # --- device/seed ---
     p.add_argument(
@@ -65,7 +58,7 @@ def build_argparser():
     p.add_argument("--mode", type=str, default="mlp", choices=["mlp", "conv2d_mlp"])
 
     # --- MLP config ---
-    p.add_argument("--in_dim", type=int, default=200, help="Flattened obs size (5x40)")
+    p.add_argument("--in_dim", type=int, default=6, help="Flattened obs size")
     p.add_argument("--mlp_hidden", type=parse_int_list, default="512,256")
     p.add_argument(
         "--mlp_act",
@@ -95,7 +88,7 @@ def build_argparser():
     p.add_argument("--conv_residual", action="store_true")
 
     # --- IO ---
-    p.add_argument("--num_actions", type=int, default=40)
+    p.add_argument("--num_actions", type=int, default=4)
 
     # --- buffers ---
     p.add_argument("--regret_mem", type=int, default=100_000)
@@ -117,15 +110,14 @@ def build_argparser():
     p.add_argument("--eval_every", type=int, default=5)
     p.add_argument("--save_every", type=int, default=10)
     p.add_argument("--logdir", type=str, default="runs")
-    p.add_argument("--results_dir", type=str, default="results/deep_cfr")
+    p.add_argument("--results_dir", type=str, default="results/deep_cfr_kuhn")
     p.add_argument("--no_tb", action="store_true", help="Disable TensorBoard")
 
     return p
 
 
 def make_env():
-    # No logger during training; feel free to wire TLogger here.
-    return env_mod_1v1.env(tlogger=None, render_mode=None)
+    return env_mod_kuhn.env(tlogger=None, render_mode=None)
 
 
 def build_nets(args, device):

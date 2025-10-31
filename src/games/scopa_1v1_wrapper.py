@@ -208,37 +208,28 @@ class TeamScopa1v1Env(AECEnv):
         return self.TEAM_A if (seat_index % 2 == 0) else self.TEAM_B
 
     def _refresh_obs_and_masks(self):
-        """
-        Update observations and infos['action_mask'] for both teams,
-        but always computed from the *current seat* view.
-        """
         seat = self._current_seat
         seat_agent_name = self.base.possible_agents[seat]
 
-        # Proxy current seat view to both teams (only the acting team will use it to act)
         current_obs = self.base.observations[seat_agent_name]
         current_mask = self.base.infos[seat_agent_name].get(
             "action_mask", self.base.get_action_mask(seat_agent_name)
         )
 
-        self.observations = {
-            self.TEAM_A: current_obs,
-            self.TEAM_B: current_obs,
-        }
-        # Forward seat index & team info (useful for trainers to condition on seat id)
+        self.observations = {self.TEAM_A: current_obs, self.TEAM_B: current_obs}
         seat_meta = {
             "seat_index": seat,
-            "team_local_seat": (
-                0 if (seat % 2 == 0) else 1
-            ),  # seat within its team: {0,1}
+            "team_local_seat": 0 if (seat % 2 == 0) else 1,
             "action_mask": current_mask.astype(int, copy=False),
         }
         self.infos[self.TEAM_A].update(seat_meta)
         self.infos[self.TEAM_B].update(seat_meta)
 
-        # Keep rewards dict present (0 until terminal)
-        for a in self.agents:
-            self.rewards[a] = 0.0
+        # IMPORTANT: only clear rewards on non-terminal steps
+        is_over = any(self.terminations.values()) or any(self.truncations.values())
+        if not is_over:
+            for a in self.agents:
+                self.rewards[a] = 0.0
 
     def _episode_over_in_base(self) -> bool:
         # Base env signals end via all seats terminated or truncated
