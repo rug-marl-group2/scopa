@@ -190,14 +190,15 @@ def plot(history, bankroll):
     plt.grid(True)
     
     plt.tight_layout()
-    plt.savefig("kuhn_final_performance.png")
+    plt.savefig("cfr_leduc_final_performance.png")
     plt.show()
 
 if __name__ == "__main__":
     kuhn_poker_game = pyspiel.load_game("kuhn_poker")
+    leduc_poker_game = pyspiel.load_game("leduc_poker")
 
     trainer = CFRTrainer(game=kuhn_poker_game)
-    history = trainer.train(steps=50000, eval_interval=500)
+    history = trainer.train(steps=500, eval_interval=50)
     
     cfr_policy = trainer.get_openspiel_policy()
     random_policy = RandomPolicy(kuhn_poker_game)

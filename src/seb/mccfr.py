@@ -3,7 +3,8 @@ from dataclasses import dataclass
 from tqdm import tqdm
 from open_spiel.python import policy
 from open_spiel.python.algorithms import exploitability
-import pyspiel, openspiel_scopa   # make sure this registers your game
+import pyspiel
+import openspiel_scopa 
 import matplotlib.pyplot as plt
 
 @dataclass
@@ -96,12 +97,18 @@ class MCCFRTrainer:
         for key, node in self.info_sets.items():
             player, info_state = key
             if info_state not in tab.state_lookup:
-                continue  # skip unseen infosets
+                continue
             idx = tab.state_lookup[info_state]
             probs = np.zeros(self.game.num_distinct_actions())
-            probs[node.legal_actions] = node.strategy_sum / node.strategy_sum.sum()
+            total = node.strategy_sum.sum()
+            if total > 1e-12:  # avoid division by zero
+                probs[node.legal_actions] = node.strategy_sum / total
+            else:
+                # fallback to uniform distribution over legal actions
+                probs[node.legal_actions] = 1.0 / len(node.legal_actions)
             tab.action_probability_array[idx] = probs
         return tab
+
 
     def plot(self, history):
         plt.figure(figsize=(12, 5))
@@ -116,10 +123,10 @@ class MCCFRTrainer:
         plt.savefig("kuhn_mccfr.png")
         
 if __name__ == "__main__":
-    
-    game = pyspiel.load_game("kuhn_poker")  # after importing openspiel_scopa
+    game_kuhn = pyspiel.load_game("kuhn_poker")
+    game_leduc= pyspiel.load_game("leduc_poker") 
     game_scopa = pyspiel.load_game("scopa_game")
-    trainer = MCCFRTrainer(game_scopa)
-    hist = trainer.train(iterations=2000, eval_interval=20)
+    trainer = MCCFRTrainer(game_leduc)
+    hist = trainer.train(iterations=5000, eval_interval=50)
     print("Exploitability:", hist[-1])
     trainer.plot(hist)
