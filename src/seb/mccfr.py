@@ -2,7 +2,6 @@ import numpy as np
 from dataclasses import dataclass
 from tqdm import tqdm
 from open_spiel.python import policy
-from open_spiel.python.algorithms import exploitability
 import pyspiel
 import openspiel_scopa 
 import matplotlib.pyplot as plt
@@ -80,53 +79,119 @@ class MCCFRTrainer:
 
         return util
 
-    def train(self, iterations=10000, eval_interval=1000):
-        history = []
+    def train(self, iterations=10000):
         for t in tqdm(range(iterations), desc="MCCFR Training"):
             for player in range(self.game.num_players()):
                 s = self.game.new_initial_state()
                 self._sample(s, player, np.ones(2), np.ones(2))
-            if (t + 1) % eval_interval == 0:
-                pol = self.tabular_policy()
-                expl = exploitability.exploitability(self.game, pol)
-                history.append((t + 1, expl))
-        return history
 
     def tabular_policy(self):
-        tab = policy.TabularPolicy(self.game)
-        for key, node in self.info_sets.items():
-            player, info_state = key
-            if info_state not in tab.state_lookup:
-                continue
-            idx = tab.state_lookup[info_state]
-            probs = np.zeros(self.game.num_distinct_actions())
-            total = node.strategy_sum.sum()
-            if total > 1e-12:  # avoid division by zero
-                probs[node.legal_actions] = node.strategy_sum / total
-            else:
-                # fallback to uniform distribution over legal actions
-                probs[node.legal_actions] = 1.0 / len(node.legal_actions)
-            tab.action_probability_array[idx] = probs
-        return tab
+        return ScopaLearnedPolicy(self.game, self.info_sets)
 
-
-    def plot(self, history):
-        plt.figure(figsize=(12, 5))
-        iterations, expl_values = zip(*history)
-        plt.plot(iterations, expl_values, marker='o', linestyle='-', markersize=4)
-        plt.title('Exploitability over Time')
-        plt.xlabel('Training Iterations')
-        plt.ylabel('Exploitability (NashConv)')
-        plt.grid(True)
-        plt.tight_layout()
-        plt.show()
-        plt.savefig("kuhn_mccfr.png")
+class ScopaLearnedPolicy(policy.Policy):
+    def __init__(self, game, info_sets):
+        all_players = list(range(game.num_players()))
+        super().__init__(game, all_players)
+        self.info_sets = info_sets
+    
+    def action_probabilities(self, state):
+        if state.is_terminal():
+            return {}
         
+        player = state.current_player()
+        info_state = state.information_state_string(player)
+        key = (player, info_state)
+        
+        if key in self.info_sets:
+            node = self.info_sets[key]
+            total = node.strategy_sum.sum()
+            if total > 1e-12:
+                probs = node.strategy_sum / total
+            else:
+                # Uniform over legal actions
+                probs = np.ones(len(node.legal_actions)) / len(node.legal_actions)
+            
+            return {action: probs[i] for i, action in enumerate(node.legal_actions)}
+        else:
+            # Unseen state: uniform random
+            legal = state.legal_actions(player)
+            prob = 1.0 / len(legal)
+            return {action: prob for action in legal}
+
+class RandomPolicy(policy.Policy):
+    def __init__(self, game):
+        all_players = list(range(game.num_players()))
+        super().__init__(game, all_players)
+
+    def action_probabilities(self, state):
+        if state.is_terminal():
+            return {}
+        player = state.current_player()
+        legal_actions = state.legal_actions(player)
+        prob = 1.0 / len(legal_actions)
+        return {action: prob for action in legal_actions}
+
+def evaluate_agent(game, trained_policy, opponent_policy, num_episodes=10000):
+    
+    total_winnings = 0
+    avg_reward_history = []
+    
+    for episode in range(num_episodes):
+        if episode < num_episodes / 2:
+            agent_seat = 0
+            policies = [trained_policy, opponent_policy]
+        else:
+            agent_seat = 1
+            policies = [opponent_policy, trained_policy]
+            
+        state = game.new_initial_state()
+        while not state.is_terminal():
+            if state.is_chance_node():
+                outcomes = state.chance_outcomes()
+                acts, probs = zip(*outcomes)
+                action = np.random.choice(acts, p=probs)
+                state.apply_action(action)
+            else:
+                player = state.current_player()
+                action_probs = policies[player].action_probabilities(state)
+                actions, probs = zip(*action_probs.items())
+                action = np.random.choice(actions, p=probs)
+                state.apply_action(action)
+        
+        total_winnings += state.rewards()[agent_seat]
+        avg_reward_history.append(total_winnings / (episode + 1))
+        
+    return total_winnings / num_episodes, avg_reward_history
+
+def plot(avg_reward_history):
+    plt.figure(figsize=(8, 5))
+    plt.plot(avg_reward_history)
+    plt.title('MCCFR on Mini Scopa: Average Reward vs. Random Agent')
+    plt.xlabel('Games Played')
+    plt.ylabel('Average Reward')
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig("scopa_mccfr_performance.png")
+    
 if __name__ == "__main__":
     game_kuhn = pyspiel.load_game("kuhn_poker")
     game_leduc= pyspiel.load_game("leduc_poker") 
-    game_scopa = pyspiel.load_game("scopa_game")
-    trainer = MCCFRTrainer(game_leduc)
-    hist = trainer.train(iterations=5000, eval_interval=50)
-    print("Exploitability:", hist[-1])
-    trainer.plot(hist)
+    game_scopa = pyspiel.load_game("mini_scopa")
+    
+    print("Training MCCFR on Mini Scopa")
+    trainer = MCCFRTrainer(game_scopa)
+    hist = trainer.train(iterations=1000)
+    print(f"Visited {len(trainer.info_sets)} unique information sets")
+    
+    cfr_policy = trainer.tabular_policy()
+    random_policy = RandomPolicy(game_scopa)
+    
+    avg_reward, avg_reward_history = evaluate_agent(
+        game_scopa, 
+        cfr_policy, 
+        random_policy, 
+        num_episodes=10000
+    )
+    print(f"Average reward vs random: {avg_reward:.4f}")
+    plot(avg_reward_history)
+    
