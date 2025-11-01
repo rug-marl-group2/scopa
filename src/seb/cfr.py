@@ -6,6 +6,7 @@ import matplotlib.pyplot as plt
 
 from open_spiel.python import policy 
 from open_spiel.python.algorithms import exploitability
+import openspiel_scopa 
 
 @dataclass
 class InfoNode:
@@ -134,10 +135,6 @@ class RandomPolicy(policy.Policy):
         return {action: prob for action in legal_actions}
 
 def evaluate_agent(game, trained_policy, opponent_policy, num_episodes=10000):
-    """
-    Evaluates a policy against an opponent, playing half the games in each seat
-    to remove seat bias. Returns the unbiased average reward and bankroll.
-    """
     total_winnings = 0
     bankroll_history = []
     
@@ -152,7 +149,6 @@ def evaluate_agent(game, trained_policy, opponent_policy, num_episodes=10000):
         state = game.new_initial_state()
         while not state.is_terminal():
             if state.is_chance_node():
-                # Correctly sample a chance outcome
                 outcomes = state.chance_outcomes()
                 acts, probs = zip(*outcomes)
                 action = np.random.choice(acts, p=probs)
@@ -164,7 +160,6 @@ def evaluate_agent(game, trained_policy, opponent_policy, num_episodes=10000):
                 action = np.random.choice(actions, p=probs)
                 state.apply_action(action)
         
-        # Correctly aggregate the reward based on the agent's seat
         total_winnings += state.rewards()[agent_seat]
         bankroll_history.append(total_winnings)
         
@@ -196,6 +191,7 @@ def plot(history, bankroll):
 if __name__ == "__main__":
     kuhn_poker_game = pyspiel.load_game("kuhn_poker")
     leduc_poker_game = pyspiel.load_game("leduc_poker")
+    game_scopa = pyspiel.load_game("mini_scopa")
 
     trainer = CFRTrainer(game=kuhn_poker_game)
     history = trainer.train(steps=500, eval_interval=50)
