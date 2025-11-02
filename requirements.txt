@@ -1,6 +1,7 @@
-pettingzoo
 gymnasium
-numpy
+pettingzoo
 ipython
+open_spiel
+numpy
 tqdm
-open-spiel
+matplotlib
