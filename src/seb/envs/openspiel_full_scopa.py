@@ -79,11 +79,9 @@ class FullScopaState(pyspiel.State):
     def information_state_string(self, player):
         p = self.env.game.players[player]
         
-        # Player's hand (sorted for consistency)
         hand_cards = sorted([(c.rank, c.suit) for c in p.hand])
         hand_str = "-".join(f"{r}{s[0]}" for r, s in hand_cards)
         
-        # Table cards (sorted for consistency)
         table_cards = sorted([(c.rank, c.suit) for c in self.env.game.table])
         table_str = "-".join(f"{r}{s[0]}" for r, s in table_cards)
         
