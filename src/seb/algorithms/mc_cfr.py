@@ -144,11 +144,6 @@ class RandomPolicy(policy.Policy):
         return {action: prob for action in legal_actions}
 
 def evaluate_agent(game, trained_policy, opponent_policy, num_episodes=10000):
-    """
-    Evaluates a policy against an opponent, playing half the games in each seat
-    to remove seat bias. Returns the unbiased average reward, average reward history,
-    and scopa statistics.
-    """
     num_players = game.num_players()
     if num_players != 2:
         raise ValueError("evaluate_agent only supports 2-player games")
@@ -181,27 +176,20 @@ def evaluate_agent(game, trained_policy, opponent_policy, num_episodes=10000):
                 action = np.random.choice(actions, p=probs)
                 state.apply_action(action)
         
-        # Track rewards
         total_winnings += state.rewards()[agent_seat]
         avg_reward_history.append(total_winnings / (episode + 1))
         
-        # Track scopas (accessing the underlying MiniScopa game state)
-        if hasattr(state, 'env') and hasattr(state.env, 'game'):
-            try:
-                players = state.env.game.players
-                agent_scopas = players[agent_seat].scopas
-                opp_scopas = players[1 - agent_seat].scopas
-                
-                trained_scopas += agent_scopas
-                opponent_scopas += opp_scopas
-                
-                scopa_history['trained'].append(trained_scopas / (episode + 1))
-                scopa_history['opponent'].append(opponent_scopas / (episode + 1))
-                scopa_history['diff'].append((trained_scopas - opponent_scopas) / (episode + 1))
-            except Exception as e:
-                # If there's an error accessing scopas, print warning on first episode
-                if episode == 0:
-                    print(f"Warning: Could not track scopas: {e}")
+        players = state.env.game.players
+        agent_scopas = players[agent_seat].scopas
+        opp_scopas = players[1 - agent_seat].scopas
+        
+        trained_scopas += agent_scopas
+        opponent_scopas += opp_scopas
+        
+        scopa_history['trained'].append(trained_scopas / (episode + 1))
+        scopa_history['opponent'].append(opponent_scopas / (episode + 1))
+        scopa_history['diff'].append((trained_scopas - opponent_scopas) / (episode + 1))
+           
         
     avg_reward = total_winnings / num_episodes
     avg_trained_scopas = trained_scopas / num_episodes

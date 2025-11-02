@@ -2,7 +2,6 @@ import numpy as np
 from dataclasses import dataclass
 import pyspiel
 from tqdm import tqdm
-import matplotlib.pyplot as plt
 
 from open_spiel.python import policy 
 from open_spiel.python.algorithms import exploitability
@@ -121,7 +120,6 @@ class CFRTrainer:
         return exploitability_history
 
 class LearnedCFRPolicy(policy.Policy):
-    """Policy built from CFR info sets (doesn't require state enumeration)."""
     def __init__(self, game, info_set_map):
         all_players = list(range(game.num_players()))
         super().__init__(game, all_players)
@@ -157,11 +155,7 @@ class RandomPolicy(policy.Policy):
         return {action: prob for action in legal_actions}
 
 def evaluate_agent(game, trained_policy, opponent_policy, num_episodes=10000):
-    """
-    Evaluates a policy against an opponent, playing half the games in each seat
-    to remove seat bias. Returns the unbiased average reward, average reward history,
-    and scopa statistics.
-    """
+   
     total_winnings = 0
     avg_reward_history = []
     trained_scopas = 0
@@ -194,23 +188,18 @@ def evaluate_agent(game, trained_policy, opponent_policy, num_episodes=10000):
         total_winnings += state.rewards()[agent_seat]
         avg_reward_history.append(total_winnings / (episode + 1))
         
-        # Track scopas (accessing the underlying MiniScopa game state)
-        if hasattr(state, 'env') and hasattr(state.env, 'game'):
-            try:
-                players = state.env.game.players
-                agent_scopas = players[agent_seat].scopas
-                opp_scopas = players[1 - agent_seat].scopas
-                
-                trained_scopas += agent_scopas
-                opponent_scopas += opp_scopas
-                
-                scopa_history['trained'].append(trained_scopas / (episode + 1))
-                scopa_history['opponent'].append(opponent_scopas / (episode + 1))
-                scopa_history['diff'].append((trained_scopas - opponent_scopas) / (episode + 1))
-            except Exception as e:
-                # If there's an error accessing scopas, print warning on first episode
-                if episode == 0:
-                    print(f"Warning: Could not track scopas: {e}")
+        # Track scopas 
+        players = state.env.game.players
+        agent_scopas = players[agent_seat].scopas
+        opp_scopas = players[1 - agent_seat].scopas
+        
+        trained_scopas += agent_scopas
+        opponent_scopas += opp_scopas
+        
+        scopa_history['trained'].append(trained_scopas / (episode + 1))
+        scopa_history['opponent'].append(opponent_scopas / (episode + 1))
+        scopa_history['diff'].append((trained_scopas - opponent_scopas) / (episode + 1))
+           
         
     avg_reward = total_winnings / num_episodes
     avg_trained_scopas = trained_scopas / num_episodes

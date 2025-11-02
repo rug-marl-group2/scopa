@@ -1,29 +1,10 @@
-"""
-Team-Public-Information (TPI) Conversion for Team Mini Scopa
-
-Implements the conversion algorithm from Carminati et al. (ICML 2022):
-"A Marriage between Adversarial Team Games and 2-player Games"
-
-Converts 2v2 team game into 2-player game where each team is represented
-as a single "coordinator" who prescribes actions for all possible private states.
-"""
-
 import pyspiel
-import itertools
-from envs.team_mini_scopa_game import TeamMiniScopaEnv, MiniDeck
+from envs.team_mini_scopa_game import TeamMiniScopaEnv, MiniDeck,TeamMiniScopaGame
 from gymnasium import spaces
-
+        
 
 class TPIMiniScopaState(pyspiel.State):
-    """
-    OpenSpiel state for TPI-converted Team Mini Scopa.
     
-    Key concepts from the paper:
-    - Public state: Information common to all team members (table cards, played actions)
-    - Private state: Each player's hand (not visible to teammate)
-    - Prescription (Γ): Coordinator's action = mapping from private states to actions
-    - Team is "completely inflated" - teammates know each other's actions after they play
-    """
 
     def __init__(self, game, env=None, skip_reset=False):
         super().__init__(game)
@@ -33,11 +14,8 @@ class TPIMiniScopaState(pyspiel.State):
         self._is_terminal = False
         self.action_history = []
         
-        # Track which team is currently playing (0 or 1)
         self._current_team = 0
         
-        # Track private states for each team
-        # Private state = which cards each team member holds
         self._team_private_states = [None, None]
 
     def current_player(self):
@@ -50,22 +28,13 @@ class TPIMiniScopaState(pyspiel.State):
         return self.env.game.get_team(agent_id)
 
     def _get_private_state_id(self, player_id):
-        """
-        Get private state identifier for a player.
-        Private state = sorted tuple of cards in hand (for canonical representation)
-        """
+      
         player = self.env.game.players[player_id]
         cards = sorted([(c.rank, c.suit) for c in player.hand])
         return tuple(cards)
 
     def _get_team_private_states(self, team_id):
-        """
-        Get all possible private state combinations for a team.
-        Returns list of (player0_private_state, player1_private_state) tuples.
-        
-        In the current game state, there's only one actual private state,
-        but coordinator must prescribe actions for all possible states.
-        """
+      
         # Get the two players on this team
         if team_id == 0:
             player_ids = [0, 1]
@@ -81,14 +50,7 @@ class TPIMiniScopaState(pyspiel.State):
         return tuple(private_states)
 
     def legal_actions(self, player=None):
-        """
-        Return legal prescriptions for the coordinator.
-        
-        A prescription Γ is a mapping: private_state -> action
-        In team mini scopa, each team member can have different cards,
-        so coordinator must specify what action each member should take
-        for their specific private state.
-        """
+       
         if self._is_terminal:
             return []
         
@@ -133,11 +95,7 @@ class TPIMiniScopaState(pyspiel.State):
         return player_legal_actions
 
     def apply_action(self, action):
-        """
-        Apply a prescription from the coordinator.
-        
-        The prescription tells the current player which card to play.
-        """
+       
         self.action_history.append(action)
         self.env.step(action)
         self._is_terminal = all(self.env.terminations.values())
@@ -178,14 +136,7 @@ class TPIMiniScopaState(pyspiel.State):
         return self.rewards()
 
     def information_state_string(self, player):
-        """
-        Information state for a coordinator (team).
         
-        Includes:
-        - Public information: table cards, played actions
-        - Private information: current team member's hand
-        - Team coordination: teammate's previous actions (completely inflated)
-        """
         team_id = player
         
         # Get players on this team
@@ -217,11 +168,7 @@ class TPIMiniScopaState(pyspiel.State):
         return f"Team{team_id}:P{current_player_id}:H[{hand_str}]:T[{table_str}]:A[{history_str}]"
 
     def clone(self):
-        """Create independent copy of state for CFR"""
-        from envs.team_mini_scopa_game import TeamMiniScopaGame, TeamMiniScopaEnv
-        from gymnasium import spaces
         
-        # Create new env without resetting
         new_env = TeamMiniScopaEnv.__new__(TeamMiniScopaEnv)
         new_env.game = TeamMiniScopaGame()
         new_env.possible_agents = [f"player_{i}" for i in range(4)]

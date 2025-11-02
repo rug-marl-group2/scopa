@@ -1,14 +1,12 @@
 """
-Experiment tracking framework for CFR algorithms on MiniScopa.
-Tracks metrics during training and provides comprehensive visualization.
+AI GENERATED (but works)
 """
 
 import numpy as np
 import matplotlib.pyplot as plt
-import json
 from pathlib import Path
-from typing import Dict, List, Optional
-from dataclasses import dataclass, asdict
+from typing import  List, Optional
+from dataclasses import dataclass
 import pickle
 
 

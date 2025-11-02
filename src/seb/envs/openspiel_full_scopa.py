@@ -1,8 +1,6 @@
 import pyspiel
-from envs.full_scopa_game import FullScopaEnv
+from envs.full_scopa_game import FullScopaEnv, FullScopaGame
 from gymnasium import spaces
-
-
 class FullScopaState(pyspiel.State):
     """OpenSpiel-compatible state wrapper around FullScopaEnv."""
 
@@ -76,17 +74,9 @@ class FullScopaState(pyspiel.State):
         return [self.env.rewards[f"player_{i}"] for i in range(self.num_players)]
 
     def returns(self):
-        # OpenSpiel expects returns() synonym for rewards()
         return self.rewards()
 
     def information_state_string(self, player):
-        """
-        Information state includes:
-        - Player's hand
-        - Table cards
-        - Number of captured cards for each player
-        - Current round number
-        """
         p = self.env.game.players[player]
         
         # Player's hand (sorted for consistency)
@@ -106,11 +96,7 @@ class FullScopaState(pyspiel.State):
         return f"P{player}:R{self.env.game.round_number}:H[{hand_str}]:T[{table_str}]:C[{capture_counts}]:S[{scopa_counts}]"
 
     def clone(self):
-        """CFR-safe copy via state serialization."""
-        from envs.full_scopa_game import FullScopaGame, FullScopaEnv
-        from gymnasium import spaces
-        
-        # Create new env without resetting
+       
         new_env = FullScopaEnv.__new__(FullScopaEnv)
         new_env.num_players = self.num_players
         new_env.game = FullScopaGame(num_players=self.num_players)
@@ -153,7 +139,7 @@ class FullScopaGame(pyspiel.Game):
         )
 
         game_info = pyspiel.GameInfo(
-            num_distinct_actions=40,     # 40 possible card encodings (4 suits × 10 ranks)
+            num_distinct_actions=40,    
             max_chance_outcomes=0,
             num_players=num_players,
             min_utility=-10.0,

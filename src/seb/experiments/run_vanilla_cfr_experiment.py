@@ -1,8 +1,3 @@
-"""
-Run vanilla CFR experiment on MiniScopa with comprehensive metric tracking.
-Vanilla CFR is deterministic, so only one run is needed.
-"""
-
 import sys
 sys.path.append('..')
 
@@ -62,29 +57,14 @@ def run_vanilla_cfr_experiment(
     iterations=500,
     eval_interval=5,
     final_eval_episodes=5000,
-    compute_exploitability=False,
-    exploitability_interval=10
 ):
-    """
-    Run a single vanilla CFR experiment.
-    
-    Args:
-        iterations: Number of CFR training iterations
-        eval_interval: Evaluate policy every N iterations
-        final_eval_episodes: Number of episodes for final evaluation
-        compute_exploitability: Whether to compute exploitability during training
-        exploitability_interval: Compute exploitability every N iterations
-    """
     print("="*70)
     print("VANILLA CFR EXPERIMENT ON MINISCOPA")
     print("="*70)
     print(f"Iterations: {iterations}")
     print(f"Evaluation interval: {eval_interval}")
     print(f"Final evaluation episodes: {final_eval_episodes}")
-    if compute_exploitability:
-        print(f"Exploitability computation: ENABLED (every {exploitability_interval} iters)")
-    else:
-        print(f"Exploitability computation: DISABLED")
+    
     print("="*70)
     
     # Initialize
@@ -106,17 +86,7 @@ def run_vanilla_cfr_experiment(
             initial_state = game.new_initial_state()
             trainer._cfr_recursive(initial_state, player_id, 1.0, 1.0)
         
-        # Compute exploitability periodically
-        if compute_exploitability and (t + 1) % exploitability_interval == 0:
-            try:
-                cfr_policy = trainer.get_openspiel_policy()
-                expl = exploitability.exploitability(game, cfr_policy)
-                metrics.exploitability_iterations.append(t + 1)
-                metrics.exploitability_values.append(expl)
-                print(f"  Iter {t+1:3d}: Exploitability={expl:.6f}")
-            except Exception as e:
-                print(f"  Warning: Could not compute exploitability at iteration {t+1}: {e}")
-        
+       
         # Evaluate periodically
         if (t + 1) % eval_interval == 0:
             cfr_policy = trainer.get_openspiel_policy()
@@ -130,13 +100,10 @@ def run_vanilla_cfr_experiment(
             metrics.eval_scopas_random.append(avg_scopas_random)
             metrics.eval_scopa_diff.append(avg_scopas_trained - avg_scopas_random)
             
-            expl_str = ""
-            if compute_exploitability and metrics.exploitability_values:
-                expl_str = f", Expl={metrics.exploitability_values[-1]:.6f}"
             
             print(f"  Iter {t+1:3d}: Reward={avg_reward:+.4f}, "
                   f"Scopas(T/R)={avg_scopas_trained:.3f}/{avg_scopas_random:.3f}, "
-                  f"Diff={avg_scopas_trained - avg_scopas_random:+.3f}{expl_str}")
+                  f"Diff={avg_scopas_trained - avg_scopas_random:+.3f}")
     
     # Final comprehensive evaluation
     print(f"\nFinal evaluation ({final_eval_episodes} episodes)...")

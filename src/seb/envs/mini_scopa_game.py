@@ -69,12 +69,10 @@ class MiniScopaGame:
         if target <= 0 or not self.table:
             return False, []
         
-        # First check for exact rank match (preferred in Scopa)
         exact_matches = [c for c in self.table if c.rank == target]
         if exact_matches:
             return True, [exact_matches[0]]  # Take first exact match
         
-        # Use DP to find subset sum
         ranks = [c.rank for c in self.table]
         # comb_sums[s] stores tuple of indices whose ranks sum to s
         comb_sums = [None] * (target + 1)

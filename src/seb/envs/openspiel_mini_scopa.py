@@ -12,12 +12,11 @@ class MiniScopaState(pyspiel.State):
         if not skip_reset:
             self.env.reset()
         self._is_terminal = False
-        self.action_history = []  # Track actions for unique state identification
+        self.action_history = []  
 
     def current_player(self):
         if self._is_terminal:
             return pyspiel.PlayerId.TERMINAL
-        # Map agent_selection to OpenSpiel player index
         return self.env.agent_name_mapping[self.env.agent_selection]
 
     def legal_actions(self, player=None):
@@ -70,10 +69,8 @@ class MiniScopaState(pyspiel.State):
     
     def history_str(self):
         """Return a unique string representing the game history."""
-        # Use action history for unique identification
         history_str = "-".join(map(str, self.action_history))
         if self._is_terminal:
-            # Include rewards in terminal state key to make it unique
             rewards_str = ",".join(f"{r:.2f}" for r in self.rewards())
             return f"TERMINAL:{history_str}:{rewards_str}"
         return f"H:{history_str}:P{self.current_player()}"
@@ -84,7 +81,6 @@ class MiniScopaState(pyspiel.State):
         return [self.env.rewards[f"player_{i}"] for i in range(self.num_players)]
 
     def returns(self):
-        # OpenSpiel expects returns() synonym for rewards()
         return self.rewards()
 
     def information_state_string(self, player=None):
@@ -103,7 +99,6 @@ class MiniScopaState(pyspiel.State):
         from envs.mini_scopa_game import MiniScopaGame
         from gymnasium import spaces
         
-        # Create new env without resetting
         new_env = MiniScopaEnv.__new__(MiniScopaEnv)
         new_env.num_players = self.num_players
         new_env.game = MiniScopaGame(num_players=self.num_players)
@@ -113,11 +108,10 @@ class MiniScopaState(pyspiel.State):
         new_env.max_steps = 16
         new_env.seed = self.env.seed
         
-        # Now set the state
         new_env.set_state(self.env.get_state())
         new_state = MiniScopaState(self.get_game(), env=new_env, num_players=self.num_players, skip_reset=True)
         new_state._is_terminal = self._is_terminal
-        new_state.action_history = self.action_history.copy()  # Copy action history
+        new_state.action_history = self.action_history.copy()  
         return new_state
 
 

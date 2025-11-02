@@ -1,20 +1,3 @@
-"""
-Team Mini Scopa - 2v2 Adversarial Team Game
-
-Implementation following "A Marriage between Adversarial Team Games and 2-player Games"
-by Carminati et al. (ICML 2022).
-
-Game Structure:
-- 4 players divided into 2 teams of 2
-- Team 0: Players 0 and 1
-- Team 1: Players 2 and 3
-- 16-card deck (4 suits × 4 ranks)
-- Each player gets 4 cards
-- Teams coordinate ex ante (before game starts)
-- No communication during play
-- Asymmetric information within teams (players don't see teammate's hand)
-"""
-
 import random
 import numpy as np
 from gymnasium import spaces
@@ -72,15 +55,6 @@ class Player:
 
 
 class TeamMiniScopaGame:
-    """
-    2v2 Team Mini Scopa Game
-    
-    Key properties for adversarial team game framework:
-    - Ex ante coordination: Teams decide strategy before play
-    - Asymmetric information: Team members see own hand only
-    - Zero-sum: Team 0 vs Team 1
-    - Sequential: Players alternate
-    """
     
     def __init__(self):
         self.deck = MiniDeck()
