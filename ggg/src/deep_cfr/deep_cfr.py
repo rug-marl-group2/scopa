@@ -15,6 +15,8 @@ from tqdm import tqdm
 sys.path.append(os.path.join(os.path.dirname(__file__), "../.."))
 
 from src.mini_scopa_game import MiniDeck
+from src.openspiel_scopa import MiniScopaGame
+
 
 HIDDEN = [128, 64]
 

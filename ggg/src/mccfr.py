@@ -6,6 +6,7 @@ import pyspiel
 from open_spiel.python import policy
 from tqdm import tqdm
 
+from src.openspiel_scopa import MiniScopaGame
 
 @dataclass
 class InfoNode:

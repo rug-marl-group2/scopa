@@ -8,9 +8,10 @@ import numpy as np
 import pyspiel
 import torch
 
-# Add your DeepCFR import
 sys.path.append(os.path.dirname(__file__))
-from src.deep_cfr.deep_cfr import DeepCFR  # Replace with your actual script name
+from src.deep_cfr.deep_cfr import DeepCFR 
+
+from src.openspiel_scopa import MiniScopaGame
 
 
 class ExperimentRunner:
@@ -420,7 +421,7 @@ class ExperimentRunner:
 if __name__ == "__main__":
     # Configuration
     NUM_TRIALS = 10
-    ITERATIONS = 250
+    ITERATIONS = 500
     ADVANTAGE_EPOCHS = 5
     EVAL_FREQ = 5
 
