@@ -1,6 +1,7 @@
 import pyspiel
-from src.mini_scopa_game import MiniScopaEnv
-from src.mini_scopa_game import MiniDeck
+
+from src.mini_scopa_game import MiniDeck, MiniScopaEnv
+
 
 class MiniScopaState(pyspiel.State):
     """OpenSpiel-compatible state wrapper around MiniScopaEnv."""
@@ -23,14 +24,14 @@ class MiniScopaState(pyspiel.State):
         """Returns legal actions based on cards in player's hand."""
         if self._is_terminal:
             return []
-        
+
         # If no player specified, use current player
         if player is None:
             player = self.current_player()
-        
+
         p = self.env.game.players[player]
         legal = []
-        
+
         # Convert each card in hand to its action index
         for card in p.hand:
             for action in range(16):
@@ -42,7 +43,7 @@ class MiniScopaState(pyspiel.State):
                 if card.rank == rank and card.suit == suit:
                     legal.append(action)
                     break
-        
+
         return legal if legal else [0]  # Fallback to avoid empty list
 
     def apply_action(self, action):
@@ -71,22 +72,29 @@ class MiniScopaState(pyspiel.State):
 
     def clone(self):
         """CFR-safe copy via state serialization."""
-        from src.mini_scopa_game import MiniScopaGame
         from gymnasium import spaces
-        
+
+        from src.mini_scopa_game import MiniScopaGame
+
         # Create new env without resetting
         new_env = MiniScopaEnv.__new__(MiniScopaEnv)
         new_env.num_players = self.num_players
         new_env.game = MiniScopaGame(num_players=self.num_players)
         new_env.possible_agents = [f"player_{i}" for i in range(self.num_players)]
-        new_env.agent_name_mapping = {name: i for i, name in enumerate(new_env.possible_agents)}
-        new_env._action_spaces = {a: spaces.Discrete(16) for a in new_env.possible_agents}
+        new_env.agent_name_mapping = {
+            name: i for i, name in enumerate(new_env.possible_agents)
+        }
+        new_env._action_spaces = {
+            a: spaces.Discrete(16) for a in new_env.possible_agents
+        }
         new_env.max_steps = 16
         new_env.seed = self.env.seed
-        
+
         # Now set the state
         new_env.set_state(self.env.get_state())
-        new_state = MiniScopaState(self.get_game(), env=new_env, num_players=self.num_players, skip_reset=True)
+        new_state = MiniScopaState(
+            self.get_game(), env=new_env, num_players=self.num_players, skip_reset=True
+        )
         new_state._is_terminal = self._is_terminal
         return new_state
 
@@ -116,7 +124,7 @@ class MiniScopaGame(pyspiel.Game):
         )
 
         game_info = pyspiel.GameInfo(
-            num_distinct_actions=16,     # 16 possible card encodings
+            num_distinct_actions=16,  # 16 possible card encodings
             max_chance_outcomes=0,
             num_players=num_players,
             min_utility=-10.0,
@@ -158,5 +166,5 @@ pyspiel.register_game(
         default_loadable=True,
         provides_factored_observation_string=False,
     ),
-    _mini_scopa_factory
+    _mini_scopa_factory,
 )

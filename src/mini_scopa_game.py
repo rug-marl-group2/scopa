@@ -1,7 +1,8 @@
 import random
-import numpy as np
+
 from gymnasium import spaces
 from pettingzoo import AECEnv
+
 
 class Card:
     def __init__(self, rank: int, suit: str):
@@ -14,6 +15,7 @@ class Card:
 
 class MiniDeck:
     """16-card deck: 4 suits 4 ranks each, pairwise duplicated ranks across suits."""
+
     suits = ["cuori", "fiori", "picche", "bello"]
     ranks = {
         "cuori": [2, 5, 8, 10],
@@ -45,6 +47,7 @@ class Player:
         self.captures.clear()
         self.scopas = 0
 
+
 class MiniScopaGame:
     def __init__(self, num_players=2):
         self.num_players = num_players
@@ -68,26 +71,26 @@ class MiniScopaGame:
         target = card.rank
         if target <= 0 or not self.table:
             return False, []
-        
+
         # First check for exact rank match (preferred in Scopa)
         exact_matches = [c for c in self.table if c.rank == target]
         if exact_matches:
             return True, [exact_matches[0]]  # Take first exact match
-        
+
         ranks = [c.rank for c in self.table]
         # comb_sums[s] stores tuple of indices whose ranks sum to s
         comb_sums = [None] * (target + 1)
         comb_sums[0] = ()
-        
+
         for idx, r in enumerate(ranks):
             # Iterate in descending order to avoid reusing same card
             for s in range(target, r - 1, -1):
                 if comb_sums[s] is None and comb_sums[s - r] is not None:
                     comb_sums[s] = comb_sums[s - r] + (idx,)
-        
+
         if comb_sums[target] is None:
             return False, []
-        
+
         combo = [self.table[i] for i in comb_sums[target]]
         return True, combo
 
@@ -123,7 +126,9 @@ class MiniScopaEnv(AECEnv):
         self.num_players = num_players
         self.game = MiniScopaGame(num_players=num_players)
         self.possible_agents = [f"player_{i}" for i in range(num_players)]
-        self.agent_name_mapping = {name: i for i, name in enumerate(self.possible_agents)}
+        self.agent_name_mapping = {
+            name: i for i, name in enumerate(self.possible_agents)
+        }
         self._action_spaces = {a: spaces.Discrete(16) for a in self.possible_agents}
         self.max_steps = num_players * 4  # 4 cards per player
         self.seed = seed
@@ -158,20 +163,27 @@ class MiniScopaEnv(AECEnv):
             self.game.play_card(card, player)
 
         self.step_count += 1
-        is_terminal = all(len(p.hand) == 0 for p in self.game.players) or self.step_count >= self.max_steps
+        is_terminal = (
+            all(len(p.hand) == 0 for p in self.game.players)
+            or self.step_count >= self.max_steps
+        )
         if is_terminal:
             r = self.game.evaluate_game()
             for i, a in enumerate(self.agents):
                 self.rewards[a] = r[i]
                 self.terminations[a] = True
 
-        self.agent_selection = self.agents[(self.agents.index(agent) + 1) % self.num_players]
+        self.agent_selection = self.agents[
+            (self.agents.index(agent) + 1) % self.num_players
+        ]
 
     def get_state(self):
         return {
             "table": [(c.rank, c.suit) for c in self.game.table],
             "hands": [[(c.rank, c.suit) for c in p.hand] for p in self.game.players],
-            "captures": [[(c.rank, c.suit) for c in p.captures] for p in self.game.players],
+            "captures": [
+                [(c.rank, c.suit) for c in p.captures] for p in self.game.players
+            ],
             "scopas": [p.scopas for p in self.game.players],
             "agent_selection": self.agent_selection,
             "step_count": self.step_count,
