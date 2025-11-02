@@ -193,4 +193,3 @@ class MiniScopaEnv(AECEnv):
         self.rewards = dict(state["rewards"])
         self.terminations = dict(state["terminations"])
         self.truncations = dict(state["truncations"])
-

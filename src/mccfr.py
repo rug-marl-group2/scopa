@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from tqdm import tqdm
 from open_spiel.python import policy
 import pyspiel
-import openspiel_scopa 
+import src.openspiel_scopa 
 import matplotlib.pyplot as plt
 
 @dataclass

@@ -1,8 +1,6 @@
 pettingzoo
 gymnasium
 numpy
-tlogger
 ipython
-tensorboardX
 tqdm
-jax
+open-spiel

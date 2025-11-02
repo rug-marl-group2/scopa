@@ -1,6 +1,6 @@
 import pyspiel
-from mini_scopa_game import MiniScopaEnv
-
+from src.mini_scopa_game import MiniScopaEnv
+from src.mini_scopa_game import MiniDeck
 
 class MiniScopaState(pyspiel.State):
     """OpenSpiel-compatible state wrapper around MiniScopaEnv."""
@@ -28,7 +28,6 @@ class MiniScopaState(pyspiel.State):
         if player is None:
             player = self.current_player()
         
-        from mini_scopa_game import MiniDeck
         p = self.env.game.players[player]
         legal = []
         
@@ -72,7 +71,7 @@ class MiniScopaState(pyspiel.State):
 
     def clone(self):
         """CFR-safe copy via state serialization."""
-        from mini_scopa_game import MiniScopaGame
+        from src.mini_scopa_game import MiniScopaGame
         from gymnasium import spaces
         
         # Create new env without resetting
