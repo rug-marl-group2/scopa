@@ -74,6 +74,7 @@ class MiniScopaGame:
         if exact_matches:
             return True, [exact_matches[0]]  # Take first exact match
         
+        # Use DP to find subset sum
         ranks = [c.rank for c in self.table]
         # comb_sums[s] stores tuple of indices whose ranks sum to s
         comb_sums = [None] * (target + 1)

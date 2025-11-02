@@ -1,5 +1,5 @@
 import pyspiel
-from mini_scopa_game import MiniScopaEnv
+from envs.mini_scopa_game import MiniScopaEnv
 
 
 class MiniScopaState(pyspiel.State):
@@ -12,6 +12,7 @@ class MiniScopaState(pyspiel.State):
         if not skip_reset:
             self.env.reset()
         self._is_terminal = False
+        self.action_history = []  # Track actions for unique state identification
 
     def current_player(self):
         if self._is_terminal:
@@ -28,7 +29,7 @@ class MiniScopaState(pyspiel.State):
         if player is None:
             player = self.current_player()
         
-        from mini_scopa_game import MiniDeck
+        from envs.mini_scopa_game import MiniDeck
         p = self.env.game.players[player]
         legal = []
         
@@ -48,11 +49,34 @@ class MiniScopaState(pyspiel.State):
 
     def apply_action(self, action):
         """Applies action to environment and updates terminal flag."""
+        self.action_history.append(action)
         self.env.step(action)
         self._is_terminal = all(self.env.terminations.values())
+    
+    def _apply_action(self, action):
+        """Internal method called by OpenSpiel for exploitability computation."""
+        self.apply_action(action)
 
     def is_terminal(self):
         return self._is_terminal
+    
+    def is_chance_node(self):
+        """Scopa has no chance nodes after initial deal."""
+        return False
+    
+    def chance_outcomes(self):
+        """No chance outcomes in Scopa (deterministic after deal)."""
+        return []
+    
+    def history_str(self):
+        """Return a unique string representing the game history."""
+        # Use action history for unique identification
+        history_str = "-".join(map(str, self.action_history))
+        if self._is_terminal:
+            # Include rewards in terminal state key to make it unique
+            rewards_str = ",".join(f"{r:.2f}" for r in self.rewards())
+            return f"TERMINAL:{history_str}:{rewards_str}"
+        return f"H:{history_str}:P{self.current_player()}"
 
     def rewards(self):
         if not self._is_terminal:
@@ -63,8 +87,12 @@ class MiniScopaState(pyspiel.State):
         # OpenSpiel expects returns() synonym for rewards()
         return self.rewards()
 
-    def information_state_string(self, player):
+    def information_state_string(self, player=None):
         """Simplified info string: player's hand and table size."""
+        if player is None:
+            player = self.current_player()
+        if self._is_terminal or player < 0:
+            return f"TERMINAL"
         p = self.env.game.players[player]
         hand_str = "-".join(f"{c.rank}{c.suit[0]}" for c in p.hand)
         table_str = "-".join(f"{c.rank}{c.suit[0]}" for c in self.env.game.table)
@@ -72,7 +100,7 @@ class MiniScopaState(pyspiel.State):
 
     def clone(self):
         """CFR-safe copy via state serialization."""
-        from mini_scopa_game import MiniScopaGame
+        from envs.mini_scopa_game import MiniScopaGame
         from gymnasium import spaces
         
         # Create new env without resetting
@@ -89,6 +117,7 @@ class MiniScopaState(pyspiel.State):
         new_env.set_state(self.env.get_state())
         new_state = MiniScopaState(self.get_game(), env=new_env, num_players=self.num_players, skip_reset=True)
         new_state._is_terminal = self._is_terminal
+        new_state.action_history = self.action_history.copy()  # Copy action history
         return new_state
 
 

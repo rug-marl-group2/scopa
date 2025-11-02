@@ -1,10 +1,10 @@
+from typing import Any
+
+
 import numpy as np
 from dataclasses import dataclass
 from tqdm import tqdm
 from open_spiel.python import policy
-import pyspiel
-import openspiel_scopa 
-import matplotlib.pyplot as plt
 
 @dataclass
 class InfoNode:
@@ -40,7 +40,7 @@ class MCCFRTrainer:
 
         if state.is_chance_node():
             outcomes = state.chance_outcomes()
-            acts, probs = zip(*outcomes)
+            acts, probs = zip[tuple[Any, ...]](*outcomes)
             action = np.random.choice(acts, p=probs)
             next_state = state.clone()
             next_state.apply_action(action)
@@ -67,23 +67,36 @@ class MCCFRTrainer:
         util = self._sample(next_state, traversing_player, new_reach, new_sampling)
 
         if player == traversing_player:
-            # Compute counterfactual regrets for this sampled action
+            # Compute counterfactual regrets for all actions
             cfv_all = np.zeros(len(legal))
             for i, a in enumerate(legal):
                 tmp_state = state.clone()
                 tmp_state.apply_action(a)
-                cfv_all[i] = self._sample(tmp_state, traversing_player, reach_probs, sampling_probs)
+                # When evaluating action a, update sampling prob for that branch
+                tmp_sampling = sampling_probs.copy()
+                tmp_sampling[player] *= sigma[i]
+                cfv_all[i] = self._sample(tmp_state, traversing_player, reach_probs, tmp_sampling)
             v = np.dot(sigma, cfv_all)
-            node.regret_sum += (reach_probs[1 - player] / sampling_probs[player]) * (cfv_all - v)
+            # Importance sampling weight: opponent reach / our sampling
+            opp_reach = np.prod([reach_probs[p] for p in range(len(reach_probs)) if p != player])
+            weight = opp_reach / sampling_probs[player] if sampling_probs[player] > 0 else 0
+            node.regret_sum += weight * (cfv_all - v)
             node.strategy_sum += reach_probs[player] * sigma
 
         return util
 
+    def iteration(self):
+        """Run a single iteration of MCCFR (one pass for each player)."""
+        for player in range(self.game.num_players()):
+            s = self.game.new_initial_state()
+            self._sample(s, player, np.ones(2), np.ones(2))
+    
     def train(self, iterations=10000):
+        history = []
         for t in tqdm(range(iterations), desc="MCCFR Training"):
-            for player in range(self.game.num_players()):
-                s = self.game.new_initial_state()
-                self._sample(s, player, np.ones(2), np.ones(2))
+            self.iteration()
+        
+        return history
 
     def tabular_policy(self):
         return ScopaLearnedPolicy(self.game, self.info_sets)
@@ -108,17 +121,16 @@ class ScopaLearnedPolicy(policy.Policy):
             if total > 1e-12:
                 probs = node.strategy_sum / total
             else:
-                # Uniform over legal actions
                 probs = np.ones(len(node.legal_actions)) / len(node.legal_actions)
             
             return {action: probs[i] for i, action in enumerate(node.legal_actions)}
         else:
-            # Unseen state: uniform random
             legal = state.legal_actions(player)
             prob = 1.0 / len(legal)
             return {action: prob for action in legal}
 
 class RandomPolicy(policy.Policy):
+    """Policy that chooses actions uniformly at random."""
     def __init__(self, game):
         all_players = list(range(game.num_players()))
         super().__init__(game, all_players)
@@ -132,9 +144,20 @@ class RandomPolicy(policy.Policy):
         return {action: prob for action in legal_actions}
 
 def evaluate_agent(game, trained_policy, opponent_policy, num_episodes=10000):
+    """
+    Evaluates a policy against an opponent, playing half the games in each seat
+    to remove seat bias. Returns the unbiased average reward, average reward history,
+    and scopa statistics.
+    """
+    num_players = game.num_players()
+    if num_players != 2:
+        raise ValueError("evaluate_agent only supports 2-player games")
     
     total_winnings = 0
     avg_reward_history = []
+    trained_scopas = 0
+    opponent_scopas = 0
+    scopa_history = {'trained': [], 'opponent': [], 'diff': []}
     
     for episode in range(num_episodes):
         if episode < num_episodes / 2:
@@ -158,40 +181,38 @@ def evaluate_agent(game, trained_policy, opponent_policy, num_episodes=10000):
                 action = np.random.choice(actions, p=probs)
                 state.apply_action(action)
         
+        # Track rewards
         total_winnings += state.rewards()[agent_seat]
         avg_reward_history.append(total_winnings / (episode + 1))
         
-    return total_winnings / num_episodes, avg_reward_history
-
-def plot(avg_reward_history):
-    plt.figure(figsize=(8, 5))
-    plt.plot(avg_reward_history)
-    plt.title('MCCFR on Mini Scopa: Average Reward vs. Random Agent')
-    plt.xlabel('Games Played')
-    plt.ylabel('Average Reward')
-    plt.grid(True)
-    plt.tight_layout()
-    plt.savefig("scopa_mccfr_performance.png")
+        # Track scopas (accessing the underlying MiniScopa game state)
+        if hasattr(state, 'env') and hasattr(state.env, 'game'):
+            try:
+                players = state.env.game.players
+                agent_scopas = players[agent_seat].scopas
+                opp_scopas = players[1 - agent_seat].scopas
+                
+                trained_scopas += agent_scopas
+                opponent_scopas += opp_scopas
+                
+                scopa_history['trained'].append(trained_scopas / (episode + 1))
+                scopa_history['opponent'].append(opponent_scopas / (episode + 1))
+                scopa_history['diff'].append((trained_scopas - opponent_scopas) / (episode + 1))
+            except Exception as e:
+                # If there's an error accessing scopas, print warning on first episode
+                if episode == 0:
+                    print(f"Warning: Could not track scopas: {e}")
+        
+    avg_reward = total_winnings / num_episodes
+    avg_trained_scopas = trained_scopas / num_episodes
+    avg_opponent_scopas = opponent_scopas / num_episodes
     
-if __name__ == "__main__":
-    game_kuhn = pyspiel.load_game("kuhn_poker")
-    game_leduc= pyspiel.load_game("leduc_poker") 
-    game_scopa = pyspiel.load_game("mini_scopa")
+    scopa_stats = {
+        'trained_avg': avg_trained_scopas,
+        'opponent_avg': avg_opponent_scopas,
+        'difference': avg_trained_scopas - avg_opponent_scopas,
+        'history': scopa_history,
+        'data_collected': len(scopa_history['trained']) > 0
+    }
     
-    print("Training MCCFR on Mini Scopa")
-    trainer = MCCFRTrainer(game_scopa)
-    hist = trainer.train(iterations=1000)
-    print(f"Visited {len(trainer.info_sets)} unique information sets")
-    
-    cfr_policy = trainer.tabular_policy()
-    random_policy = RandomPolicy(game_scopa)
-    
-    avg_reward, avg_reward_history = evaluate_agent(
-        game_scopa, 
-        cfr_policy, 
-        random_policy, 
-        num_episodes=10000
-    )
-    print(f"Average reward vs random: {avg_reward:.4f}")
-    plot(avg_reward_history)
-    
+    return avg_reward, avg_reward_history, scopa_stats

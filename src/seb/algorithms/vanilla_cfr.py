@@ -6,8 +6,6 @@ import matplotlib.pyplot as plt
 
 from open_spiel.python import policy 
 from open_spiel.python.algorithms import exploitability
-import openspiel_scopa 
-
 @dataclass
 class InfoNode:
     legal_actions: np.ndarray
@@ -73,7 +71,8 @@ class CFRTrainer:
         
         #player node
         #current player is who is playing right now, traversing_player is the perspective
-        node = self._get_or_create_node(state.information_state_string(), state.legal_actions()) #players need to have different information state string
+        current_player = state.current_player()
+        node = self._get_or_create_node(state.information_state_string(current_player), state.legal_actions()) #players need to have different information state string
         
         node_util_for_traversing_player = 0
         action_utils = np.zeros(len(state.legal_actions()))    
@@ -81,14 +80,14 @@ class CFRTrainer:
         for i, action in enumerate(state.legal_actions()):
             next_state = state.clone()
             next_state.apply_action(action)
-            if state.current_player() == 0:
+            if current_player == 0:
                 action_utils[i] = self._cfr_recursive(next_state, traversing_player, reach_p0 * node.local_strategy[i], reach_p1)
             else:
                 action_utils[i] = self._cfr_recursive(next_state, traversing_player, reach_p0 , reach_p1 * node.local_strategy[i])
         
         node_util_for_traversing_player = np.sum(node.local_strategy * action_utils) 
         
-        if state.current_player() == traversing_player:
+        if current_player == traversing_player:
             reach_prob = reach_p0 if 0 == traversing_player else reach_p1
             opponent_reach_prob = reach_p1 if 0 == traversing_player else reach_p0
                         
@@ -100,28 +99,51 @@ class CFRTrainer:
         
         return node_util_for_traversing_player
     
-    def get_openspiel_policy(self) -> policy.TabularPolicy:
-        tabular_policy = policy.TabularPolicy(self.game)
-        for state_key, infoset in self.info_set_map.items():
-            i = tabular_policy.state_lookup[state_key]
-            policy_probs = np.zeros(self.game.num_distinct_actions())
-            policy_probs[infoset.legal_actions] = infoset.policy
-            tabular_policy.action_probability_array[i] = policy_probs
-        return tabular_policy
+    def get_openspiel_policy(self):
+        """Build policy from visited info sets (doesn't enumerate all states)."""
+        return LearnedCFRPolicy(self.game, self.info_set_map)
 
-    def train(self, steps: int, eval_interval: int = 1000):
+    def train(self, steps: int, eval_interval: int = 1000, compute_exploitability: bool = False):
         exploitability_history = []
         for t in tqdm(range(steps), desc="CFR Training"):
             for i in range(self.game.num_players()):
                 initial_state = self.game.new_initial_state()
                 self._cfr_recursive(initial_state, i, 1.0, 1.0)
             
-            if (t + 1) % eval_interval == 0:
-                policy = self.get_openspiel_policy()
-                expl = exploitability.exploitability(self.game, policy)
-                exploitability_history.append((t + 1, expl))
+            if compute_exploitability and (t + 1) % eval_interval == 0:
+                try:
+                    policy_obj = self.get_openspiel_policy()
+                    expl = exploitability.exploitability(self.game, policy_obj)
+                    exploitability_history.append((t + 1, expl))
+                except Exception as e:
+                    tqdm.write(f"Warning: Could not compute exploitability at iteration {t+1}: {e}")
                 
         return exploitability_history
+
+class LearnedCFRPolicy(policy.Policy):
+    """Policy built from CFR info sets (doesn't require state enumeration)."""
+    def __init__(self, game, info_set_map):
+        all_players = list(range(game.num_players()))
+        super().__init__(game, all_players)
+        self.info_set_map = info_set_map
+    
+    def action_probabilities(self, state):
+        if state.is_terminal():
+            return {}
+        
+        player = state.current_player()
+        info_state = state.information_state_string(player)
+        
+        if info_state in self.info_set_map:
+            node = self.info_set_map[info_state]
+            legal_actions = state.legal_actions()
+            probs = node.policy
+            return {action: probs[i] for i, action in enumerate(legal_actions)}
+        else:
+            # If we haven't seen this state, return uniform random
+            legal_actions = state.legal_actions()
+            prob = 1.0 / len(legal_actions)
+            return {action: prob for action in legal_actions}
 
 class RandomPolicy(policy.Policy):
     """Policy that chooses actions uniformly at random."""
@@ -135,8 +157,16 @@ class RandomPolicy(policy.Policy):
         return {action: prob for action in legal_actions}
 
 def evaluate_agent(game, trained_policy, opponent_policy, num_episodes=10000):
+    """
+    Evaluates a policy against an opponent, playing half the games in each seat
+    to remove seat bias. Returns the unbiased average reward, average reward history,
+    and scopa statistics.
+    """
     total_winnings = 0
-    bankroll_history = []
+    avg_reward_history = []
+    trained_scopas = 0
+    opponent_scopas = 0
+    scopa_history = {'trained': [], 'opponent': [], 'diff': []}
     
     for episode in range(num_episodes):
         if episode < num_episodes / 2:
@@ -160,50 +190,38 @@ def evaluate_agent(game, trained_policy, opponent_policy, num_episodes=10000):
                 action = np.random.choice(actions, p=probs)
                 state.apply_action(action)
         
+        # Track rewards
         total_winnings += state.rewards()[agent_seat]
-        bankroll_history.append(total_winnings)
+        avg_reward_history.append(total_winnings / (episode + 1))
         
-    return total_winnings / num_episodes, bankroll_history
-
-def plot(history, bankroll):
-    plt.figure(figsize=(12, 5))
-
-    plt.subplot(1, 2, 1)
-    iterations, expl_values = zip(*history)
-    plt.plot(iterations, expl_values, marker='o', linestyle='-', markersize=4)
-    plt.title('Exploitability over Time')
-    plt.xlabel('Training Iterations')
-    plt.ylabel('Exploitability (NashConv)')
-    plt.grid(True)
+        # Track scopas (accessing the underlying MiniScopa game state)
+        if hasattr(state, 'env') and hasattr(state.env, 'game'):
+            try:
+                players = state.env.game.players
+                agent_scopas = players[agent_seat].scopas
+                opp_scopas = players[1 - agent_seat].scopas
+                
+                trained_scopas += agent_scopas
+                opponent_scopas += opp_scopas
+                
+                scopa_history['trained'].append(trained_scopas / (episode + 1))
+                scopa_history['opponent'].append(opponent_scopas / (episode + 1))
+                scopa_history['diff'].append((trained_scopas - opponent_scopas) / (episode + 1))
+            except Exception as e:
+                # If there's an error accessing scopas, print warning on first episode
+                if episode == 0:
+                    print(f"Warning: Could not track scopas: {e}")
+        
+    avg_reward = total_winnings / num_episodes
+    avg_trained_scopas = trained_scopas / num_episodes
+    avg_opponent_scopas = opponent_scopas / num_episodes
     
-    # Bankroll Plot
-    plt.subplot(1, 2, 2)
-    plt.plot(bankroll)
-    plt.title('Bankroll vs. Random Agent')
-    plt.xlabel('Games Played')
-    plt.ylabel('Cumulative Winnings')
-    plt.grid(True)
+    scopa_stats = {
+        'trained_avg': avg_trained_scopas,
+        'opponent_avg': avg_opponent_scopas,
+        'difference': avg_trained_scopas - avg_opponent_scopas,
+        'history': scopa_history,
+        'data_collected': len(scopa_history['trained']) > 0
+    }
     
-    plt.tight_layout()
-    plt.savefig("cfr_leduc_final_performance.png")
-    plt.show()
-
-if __name__ == "__main__":
-    kuhn_poker_game = pyspiel.load_game("kuhn_poker")
-    leduc_poker_game = pyspiel.load_game("leduc_poker")
-    game_scopa = pyspiel.load_game("mini_scopa")
-
-    trainer = CFRTrainer(game=kuhn_poker_game)
-    history = trainer.train(steps=500, eval_interval=50)
-    
-    cfr_policy = trainer.get_openspiel_policy()
-    random_policy = RandomPolicy(kuhn_poker_game)
-
-    avg_reward, bankroll = evaluate_agent(
-        kuhn_poker_game, 
-        cfr_policy, 
-        random_policy, 
-        num_episodes=20000
-    )
-    print("average reward", avg_reward)
-    plot(history, bankroll)
+    return avg_reward, avg_reward_history, scopa_stats
