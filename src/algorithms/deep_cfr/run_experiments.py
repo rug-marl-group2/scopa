@@ -9,9 +9,9 @@ import pyspiel
 import torch
 
 sys.path.append(os.path.dirname(__file__))
-from src.deep_cfr.deep_cfr import DeepCFR 
+from src.algorithms.deep_cfr.deep_cfr import DeepCFR 
 
-from src.openspiel_scopa import MiniScopaGame
+from src.envs.openspiel_mini_scopa import MiniScopaGame
 
 
 class ExperimentRunner:

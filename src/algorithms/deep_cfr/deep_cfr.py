@@ -14,8 +14,8 @@ from tqdm import tqdm
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "../.."))
 
-from src.mini_scopa_game import MiniDeck
-from src.openspiel_scopa import MiniScopaGame
+from src.envs.mini_scopa_game import MiniDeck
+from src.envs.openspiel_mini_scopa import MiniScopaGame
 
 
 HIDDEN = [128, 64]
@@ -597,8 +597,13 @@ if __name__ == "__main__":
     # Load your game
     game = pyspiel.load_game("mini_scopa")
 
+    # Set device
+    device = ("cuda" if torch.cuda.is_available()
+            else ("mps" if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available()
+                    else "cpu"))   
+     
     # Initialize Deep CFR
-    deep_cfr = DeepCFR(game, num_players=2, device="cuda")
+    deep_cfr = DeepCFR(game, num_players=2, device=device)
 
     # Train
     print("Starting Deep CFR training...")
