@@ -1,76 +1,44 @@
+## 🚀 Quickstart
 
-## Installation
-
-```bash
-wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
-```
+### 1) Create & activate a virtual environment (Python ≥3.10)
 
 ```bash
-bash Miniconda3-latest-Linux-x86_64.sh
+# from repo root
+python3 -m venv .venv
+source .venv/bin/activate          # (Linux/macOS)
+# .\.venv\Scripts\activate         # (Windows PowerShell)
 ```
 
+### 2) Install dependencies
 
 ```bash
-conda create --name scopa_jax python=3.11 --channel conda-forge
+pip intall -r requirements.txt
 ```
+
+Also make sure to install torch seperately.
+
+### CPU-only
+```bash
+pip install torch
+```
+### CUDA 11.8
+```bash
+pip install torch --index-url https://download.pytorch.org/whl/cu118
+```
+
+### CUDA 12.1
+```bash
+pip install torch --index-url https://download.pytorch.org/whl/cu121
+```
+
+### 3) Run Scripts
 
 ```bash
-conda activate scopa_jax
+ipython src/cfr_mini_scopa.py # run cfr algo
+ipython src/mccfr_mini_scopa.py # run mccfr algo
+ipython src/algorithms/deep_cfr.py # run sdcfr algo
 ```
 
-```bash
-conda install -c conda-forge pettingzoo gymnasium numpy ipython -y
-```
+## 🧠 Methodology
 
-```bash
-conda install -c conda-forge tensorboardx tensorboard -y
-```
-
-```bash
-pip install --upgrade "jax[cuda12]" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html 
-```
-
-```bash
-
-```
-
-```bash
-
-```
-
-## Pure-JAX Environment (experimental)
-
-This repo includes a pure-JAX implementation of the Scopa environment for batched, jitted rollouts.
-
-- Cards/helpers: `src/jax_cards.py`
-- JAX env: `src/jax_env.py` (state, jitted `step`, `evaluate_round`, `lax.scan` rollouts)
-
-Quick sanity run (random policy):
-
-```bash
-python - <<'PY'
-import jax
-from jax import random
-from jax_env import play_round_scan, uniform_policy
-
-key = random.PRNGKey(0)
-key, state, (r0, r1) = play_round_scan(key, None, uniform_policy)
-print('Rewards (team0, team1):', int(r0), int(r1))
-PY
-```
-
-Batch rollouts:
-
-```python
-from jax_env import play_rounds_batched, uniform_policy
-from jax import random
-
-key = random.PRNGKey(1)
-key_out, states, (r0, r1) = play_rounds_batched(key, None, uniform_policy, batch_size=512)
-print('Batch mean rewards:', r0.mean(), r1.mean())
-```
-
-Notes:
-- The JAX env uses a fixed 6x40 observation layout compatible with the original code.
-- Capture logic and scoring are implemented with JAX control flow and array ops for `jit` and `vmap`.
-- For “pure JAX” CFR/Deep CFR, plug a JAX/Flax policy in place of `uniform_policy` and run batched `play_rounds_batched` to collect data and compute losses.
+In this project we train **CFR**, **MCCFR** and **SDCFR** for our simplified abstracted **Miniscopa** 1v1 zero-sum card-game, derived from the tradition Italian 2v2 mixed-sum game **Scopone Scientifico d'Assi**.
